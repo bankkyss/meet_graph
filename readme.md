@@ -7,10 +7,10 @@
 ## Workflow Diagrams
 
 ### Standard Workflow (`/generate`)
-![LangGraph Standard Workflow](langgraph_flow_standard.png)
+![LangGraph Standard Workflow](docs/langgraph_flow/langgraph_flow_standard.png)
 
 ### ReAct + Official Editor Workflow (`/generate_react`)
-![LangGraph ReAct Workflow](langgraph_flow_react.png)
+![LangGraph ReAct Workflow](docs/langgraph_flow/langgraph_flow_react.png)
 
 ## Techniques ที่ใช้
 

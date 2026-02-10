@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+data
+output
+test_flow_output
+docs
+*.pdf
+.env

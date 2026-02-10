@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Meeting Minutes (Detailed + Token-Safe)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: "Sarabun", sans-serif; }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen py-10">
+  <div class="container mx-auto px-4 max-w-5xl">
+    <div class="bg-white rounded-2xl shadow-2xl p-10">
+      <div class="text-center mb-8">
+        <h1 class="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600 mb-3">
+          AI Meeting Minutes Generator
+        </h1>
+        <p class="text-gray-600 text-lg">LangGraph + Evidence Retrieval + 2-Pass (Outline to Expand)</p>
+        <p class="text-sm text-green-700 mt-2">Details improved and Typhoon token guard enabled</p>
+      </div>
+
+      <form id="mainForm" class="space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div>
+            <label class="block text-sm font-semibold text-gray-700 mb-2">รายชื่อผู้เข้าประชุม</label>
+            <textarea name="attendees_text" rows="8" required class="w-full rounded-lg border p-3 text-sm"></textarea>
+          </div>
+          <div>
+            <label class="block text-sm font-semibold text-gray-700 mb-2">วาระการประชุม</label>
+            <textarea name="agenda_text" rows="8" required class="w-full rounded-lg border p-3 text-sm"></textarea>
+          </div>
+        </div>
+
+        <div class="border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center bg-white">
+          <label class="cursor-pointer">
+            <span class="text-gray-700 font-medium block mb-3">อัปโหลดไฟล์ Transcript (.json)</span>
+            <input type="file" name="file" accept=".json" required class="block w-full text-sm">
+          </label>
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-2">โหมด Workflow</label>
+          <select name="workflow_mode" class="w-full rounded-lg border p-3 text-sm">
+            <option value="standard">Standard (/generate)</option>
+            <option value="react">ReAct + Reflexion (/generate_react)</option>
+          </select>
+        </div>
+
+        <button type="submit" class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold py-4 px-6 rounded-xl">
+          สร้างรายงาน (Background Job)
+        </button>
+      </form>
+
+      <div id="statusArea" class="hidden mt-8 p-6 rounded-xl text-center bg-blue-50 border border-blue-200">
+        <div id="loadingSpinner" class="animate-spin rounded-full h-12 w-12 border-b-4 border-indigo-600 mx-auto mb-3"></div>
+        <p id="statusText" class="font-semibold text-gray-800 text-lg mb-2">กำลังประมวลผล...</p>
+        <p id="timerText" class="text-sm text-gray-600 mb-3">เวลาผ่านไป: 0 วินาที</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("mainForm");
+    const statusArea = document.getElementById("statusArea");
+    const statusText = document.getElementById("statusText");
+    const timerText = document.getElementById("timerText");
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    async function fetchJobOrThrow(jobId) {
+      const res = await fetch(`/jobs/${jobId}`);
+      let payload = {};
+      try { payload = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        const msg = payload.detail || payload.error || "Job status error";
+        throw new Error(msg);
+      }
+      return payload;
+    }
+
+    async function waitForJob(jobId) {
+      while (true) {
+        const payload = await fetchJobOrThrow(jobId);
+        if (payload.status === "succeeded") {
+          return payload;
+        }
+        if (payload.status === "failed") {
+          throw new Error(payload.error || "Job failed");
+        }
+        await sleep(2000);
+      }
+    }
+
+    async function downloadResult(resultUrl, fallbackName) {
+      const res = await fetch(resultUrl);
+      let errorPayload = null;
+      if (!res.ok) {
+        try { errorPayload = await res.json(); } catch (_) {}
+        throw new Error((errorPayload && errorPayload.detail) || "Download failed");
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const header = res.headers.get("Content-Disposition");
+      let fileName = fallbackName || "Meeting_Report_Detailed.html";
+      if (header && header.indexOf("filename=") !== -1) {
+        fileName = header.split("filename=")[1].replace(/[\"']/g, "");
+      }
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    }
+
+    form.onsubmit = async function (e) {
+      e.preventDefault();
+      statusArea.classList.remove("hidden");
+      statusText.innerText = "กำลังส่งงานเข้าคิว...";
+      let seconds = 0;
+      const timer = setInterval(() => {
+        seconds++;
+        timerText.innerText = `เวลาผ่านไป: ${seconds} วินาที`;
+      }, 1000);
+
+      try {
+        const formData = new FormData(form);
+        const mode = (formData.get("workflow_mode") || "standard").toString();
+        const endpoint = mode === "react" ? "/generate_react" : "/generate";
+        const res = await fetch(endpoint, { method: "POST", body: formData });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || "Server Error");
+        }
+        const payload = await res.json();
+        if (!payload.job_id) {
+          throw new Error("Missing job_id from server");
+        }
+        statusText.innerText = `กำลังประมวลผล... (Job: ${payload.job_id.slice(0, 8)})`;
+
+        const done = await waitForJob(payload.job_id);
+        statusText.innerText = "กำลังดาวน์โหลดผลลัพธ์...";
+        await downloadResult(done.result_url, done.filename);
+        statusText.innerText = "เสร็จแล้ว ดาวน์โหลดเรียบร้อย";
+      } catch (err) {
+        statusText.innerText = "Error: " + err.message;
+      } finally {
+        clearInterval(timer);
+      }
+    };
+  </script>
+</body>
+</html>

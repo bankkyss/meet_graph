@@ -21,11 +21,14 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
@@ -40,6 +43,103 @@ app = FastAPI()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("meeting_minutes_full")
+
+JOB_OUTPUT_DIR = Path(os.getenv("JOB_OUTPUT_DIR", "output"))
+JOB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_SECONDS", "86400"))
+JOB_STORE: Dict[str, Dict[str, Any]] = {}
+JOB_LOCK = asyncio.Lock()
+
+
+def _iso_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+async def _prune_jobs() -> None:
+    if JOB_RETENTION_SECONDS <= 0:
+        return
+    now = datetime.utcnow().timestamp()
+    async with JOB_LOCK:
+        stale_ids: List[str] = []
+        for jid, item in JOB_STORE.items():
+            status = str(item.get("status", ""))
+            if status not in ("succeeded", "failed"):
+                continue
+            done_ts = float(item.get("done_ts", 0.0) or 0.0)
+            if done_ts <= 0:
+                continue
+            if now - done_ts > JOB_RETENTION_SECONDS:
+                stale_ids.append(jid)
+        for jid in stale_ids:
+            data = JOB_STORE.pop(jid, None)
+            if not data:
+                continue
+            result_path = data.get("result_path")
+            if isinstance(result_path, str) and result_path:
+                try:
+                    p = Path(result_path)
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    logger.warning("Cannot delete old result file for job %s", jid)
+
+
+async def _create_job(workflow_tag: str, filename_prefix: str) -> Dict[str, Any]:
+    await _prune_jobs()
+    job_id = uuid4().hex
+    data = {
+        "job_id": job_id,
+        "workflow_tag": workflow_tag,
+        "filename_prefix": filename_prefix,
+        "status": "queued",
+        "created_at": _iso_now(),
+        "updated_at": _iso_now(),
+        "done_ts": 0.0,
+        "error": None,
+        "result_path": None,
+        "result_filename": None,
+        "official_rewritten_count": None,
+    }
+    async with JOB_LOCK:
+        JOB_STORE[job_id] = data
+    return data
+
+
+async def _update_job(job_id: str, **fields: Any) -> None:
+    async with JOB_LOCK:
+        data = JOB_STORE.get(job_id)
+        if not data:
+            return
+        data.update(fields)
+        data["updated_at"] = _iso_now()
+
+
+async def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    async with JOB_LOCK:
+        item = JOB_STORE.get(job_id)
+        if not item:
+            return None
+        return dict(item)
+
+
+def _job_to_public(job: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(job.get("status", "unknown"))
+    job_id = str(job.get("job_id", ""))
+    payload: Dict[str, Any] = {
+        "job_id": job_id,
+        "workflow_tag": job.get("workflow_tag"),
+        "status": status,
+        "status_url": f"/jobs/{job_id}",
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+    if status == "failed":
+        payload["error"] = job.get("error")
+    if status == "succeeded":
+        payload["result_url"] = f"/jobs/{job_id}/result"
+        payload["official_rewritten_count"] = job.get("official_rewritten_count")
+        payload["filename"] = job.get("result_filename")
+    return payload
 
 
 # =========================
@@ -2587,116 +2687,23 @@ WORKFLOW_REACT = build_workflow_react()
 
 
 # =========================
-# HTML UI
+# Static UI
 # =========================
-html_content = """<!DOCTYPE html>
-<html lang="th">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Meeting Minutes (Detailed + Token-Safe)</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap" rel="stylesheet">
-  <style> body{font-family:'Sarabun',sans-serif;} </style>
-</head>
-<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen py-10">
-  <div class="container mx-auto px-4 max-w-5xl">
-    <div class="bg-white rounded-2xl shadow-2xl p-10">
-      <div class="text-center mb-8">
-        <h1 class="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600 mb-3">
-          AI Meeting Minutes Generator
-        </h1>
-        <p class="text-gray-600 text-lg">LangGraph + Evidence Retrieval + 2-Pass (Outline → Expand)</p>
-        <p class="text-sm text-green-700 mt-2">✅ รายละเอียดเพิ่มขึ้น • ✅ คุม Token Typhoon อัตโนมัติ</p>
-      </div>
-
-      <form id="mainForm" class="space-y-6">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div>
-            <label class="block text-sm font-semibold text-gray-700 mb-2">📋 รายชื่อผู้เข้าประชุม</label>
-            <textarea name="attendees_text" rows="8" required class="w-full rounded-lg border p-3 text-sm"></textarea>
-          </div>
-          <div>
-            <label class="block text-sm font-semibold text-gray-700 mb-2">📝 วาระการประชุม</label>
-            <textarea name="agenda_text" rows="8" required class="w-full rounded-lg border p-3 text-sm"></textarea>
-          </div>
-        </div>
-
-        <div class="border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center bg-white">
-          <label class="cursor-pointer">
-            <span class="text-gray-700 font-medium block mb-3">อัปโหลดไฟล์ Transcript (.json)</span>
-            <input type="file" name="file" accept=".json" required class="block w-full text-sm" />
-          </label>
-        </div>
-
-        <button type="submit" class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold py-4 px-6 rounded-xl">
-          🚀 สร้างรายงาน (DETAILED)
-        </button>
-      </form>
-
-      <div id="statusArea" class="hidden mt-8 p-6 rounded-xl text-center bg-blue-50 border border-blue-200">
-        <div id="loadingSpinner" class="animate-spin rounded-full h-12 w-12 border-b-4 border-indigo-600 mx-auto mb-3"></div>
-        <p id="statusText" class="font-semibold text-gray-800 text-lg mb-2">กำลังประมวลผล...</p>
-        <p id="timerText" class="text-sm text-gray-600 mb-3">เวลาผ่านไป: 0 วินาที</p>
-      </div>
-    </div>
-  </div>
-
-<script>
-  const form = document.getElementById('mainForm');
-  const statusArea = document.getElementById('statusArea');
-  const statusText = document.getElementById('statusText');
-  const timerText = document.getElementById('timerText');
-
-  form.onsubmit = async function(e){
-    e.preventDefault();
-    statusArea.classList.remove('hidden');
-    statusText.innerText = "กำลังประมวลผล...";
-    let seconds = 0;
-    const timer = setInterval(()=> {
-      seconds++;
-      timerText.innerText = `เวลาผ่านไป: ${seconds} วินาที`;
-    }, 1000);
-
-    try{
-      const formData = new FormData(form);
-      const res = await fetch('/generate', {method:'POST', body: formData});
-      if(!res.ok){
-        const err = await res.json();
-        throw new Error(err.detail || 'Server Error');
-      }
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const header = res.headers.get('Content-Disposition');
-      let fileName = 'Meeting_Report_Detailed.html';
-      if(header && header.indexOf('filename=') !== -1){
-        fileName = header.split('filename=')[1].replace(/[\"']/g,'');
-      }
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      statusText.innerText = "✅ เสร็จแล้ว! ดาวน์โหลดเรียบร้อย";
-    } catch(err){
-      statusText.innerText = "❌ Error: " + err.message;
-    } finally {
-      clearInterval(timer);
-    }
-  };
-</script>
-</body>
-</html>
-"""
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # =========================
 # FastAPI
 # =========================
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def main_page():
-    return html_content
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="Missing static/index.html")
+    return FileResponse(index_path)
 
 
 async def _generate_with_workflow(
@@ -2724,29 +2731,64 @@ async def _generate_with_workflow(
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"โครงสร้าง transcript ไม่ถูกต้อง: {str(e)}")
 
+    init_state: MeetingState = {
+        "attendees_text": attendees_text,
+        "agenda_text": agenda_text,
+        "transcript_json": transcript.model_dump(),
+        "transcript_index": build_transcript_index(transcript),
+    }
+    job = await _create_job(workflow_tag=workflow_tag, filename_prefix=filename_prefix)
+    job_id = str(job["job_id"])
+    logger.info("Queued job %s (%s)", job_id, workflow_tag)
+    asyncio.create_task(
+        _run_job(
+            job_id=job_id,
+            workflow=workflow,
+            workflow_tag=workflow_tag,
+            filename_prefix=filename_prefix,
+            init_state=init_state,
+        )
+    )
+    job_view = await _get_job(job_id)
+    if not job_view:
+        raise HTTPException(status_code=500, detail="ไม่สามารถสร้าง job ได้")
+    return _job_to_public(job_view)
+
+
+async def _run_job(
+    job_id: str,
+    workflow: Any,
+    workflow_tag: str,
+    filename_prefix: str,
+    init_state: MeetingState,
+) -> None:
+    await _update_job(job_id, status="running", error=None)
+    logger.info("Run workflow: %s (job=%s)", workflow_tag, job_id)
     try:
-        init_state: MeetingState = {
-            "attendees_text": attendees_text,
-            "agenda_text": agenda_text,
-            "transcript_json": transcript.model_dump(),
-            "transcript_index": build_transcript_index(transcript),
-        }
-        logger.info("Run workflow: %s", workflow_tag)
         out = await workflow.ainvoke(init_state)
         final_html = out["final_html"]
-        if "official_rewritten_count" in out:
-            logger.info("Official editor count: %s", out.get("official_rewritten_count"))
-
-        filename = f"{filename_prefix}_{now_ts()}.html"
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-        return StreamingResponse(
-            iter([final_html.encode("utf-8")]),
-            media_type="text/html; charset=utf-8",
-            headers=headers,
+        official_count = out.get("official_rewritten_count")
+        filename = f"{filename_prefix}_{now_ts()}_{job_id[:8]}.html"
+        out_path = JOB_OUTPUT_DIR / filename
+        out_path.write_text(final_html, encoding="utf-8")
+        await _update_job(
+            job_id,
+            status="succeeded",
+            done_ts=datetime.utcnow().timestamp(),
+            result_path=str(out_path),
+            result_filename=filename,
+            official_rewritten_count=official_count,
+            error=None,
         )
+        logger.info("Job succeeded: %s (%s)", job_id, out_path)
     except Exception as e:
-        logger.exception("Workflow failed: %s", workflow_tag)
-        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาด: {str(e)}")
+        logger.exception("Workflow failed: %s (job=%s)", workflow_tag, job_id)
+        await _update_job(
+            job_id,
+            status="failed",
+            done_ts=datetime.utcnow().timestamp(),
+            error=f"เกิดข้อผิดพลาด: {str(e)}",
+        )
 
 
 @app.post("/generate")
@@ -2778,6 +2820,44 @@ async def generate_report_react(
         attendees_text=attendees_text,
         agenda_text=agenda_text,
         file=file,
+    )
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    await _prune_jobs()
+    job = await _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="ไม่พบ job นี้")
+    return _job_to_public(job)
+
+
+@app.get("/jobs/{job_id}/result")
+async def get_job_result(job_id: str):
+    await _prune_jobs()
+    job = await _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="ไม่พบ job นี้")
+
+    status = str(job.get("status", ""))
+    if status != "succeeded":
+        if status == "failed":
+            raise HTTPException(status_code=409, detail=job.get("error") or "Job failed")
+        raise HTTPException(status_code=409, detail=f"Job ยังไม่เสร็จ (status={status})")
+
+    result_path_raw = job.get("result_path")
+    if not isinstance(result_path_raw, str) or not result_path_raw:
+        raise HTTPException(status_code=500, detail="ไม่พบไฟล์ผลลัพธ์ของ job")
+
+    result_path = Path(result_path_raw)
+    if not result_path.exists():
+        raise HTTPException(status_code=404, detail="ไฟล์ผลลัพธ์ถูกลบไปแล้ว")
+
+    filename = str(job.get("result_filename") or result_path.name)
+    return FileResponse(
+        path=result_path,
+        media_type="text/html; charset=utf-8",
+        filename=filename,
     )
 
 

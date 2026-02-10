@@ -1,0 +1,10 @@
+fastapi==0.128.5
+uvicorn==0.40.0
+python-dotenv==1.2.1
+pydantic==2.12.5
+openai==2.17.0
+langgraph==1.0.8
+langchain-core==1.2.9
+python-multipart==0.0.22
+# Needed only when running `test_flow.py --with-images`
+opencv-python-headless==4.13.0.92
