@@ -10,6 +10,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
 COPY meeting_minutes_graphrag_fastapi.py /app/meeting_minutes_graphrag_fastapi.py
+COPY api /app/api
+COPY services /app/services
 COPY static /app/static
 
 EXPOSE 8011

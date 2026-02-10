@@ -92,6 +92,31 @@
 ### `POST /generate_react`
 ใช้ ReAct workflow + Official Editor pass (ภาษาทางการกว่า)
 
+### `GET /jobs/{job_id}`
+เช็คสถานะงาน background (`queued/running/succeeded/failed`)
+
+### `GET /jobs/{job_id}/result`
+ดาวน์โหลดผล HTML เมื่อ job สำเร็จ
+
+## Refactor Structure
+
+- `meeting_minutes_graphrag_fastapi.py`
+  - คงเฉพาะ LangGraph pipeline + FastAPI endpoint wiring
+  - endpoint ตอบกลับด้วย schema (`response_model`) ชัดเจน
+- `services/workflow_jobs.py`
+  - แยก service สำหรับ background jobs:
+    - queue/run workflow
+    - job lifecycle + retention
+    - result file management
+- `services/meeting_workflow.py`
+  - แยก pipeline หลักออกจาก FastAPI:
+    - models + utilities
+    - Typhoon client + graph agents
+    - LangGraph state + `WORKFLOW` / `WORKFLOW_REACT`
+- `api/schemas.py`
+  - schema กลางสำหรับ endpoint response:
+    - `JobStatusResponse`
+
 ## วิธีรัน API
 
 ```bash
