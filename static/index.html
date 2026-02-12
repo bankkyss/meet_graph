@@ -33,11 +33,20 @@
           </div>
         </div>
 
-        <div class="border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center bg-white">
-          <label class="cursor-pointer">
-            <span class="text-gray-700 font-medium block mb-3">อัปโหลดไฟล์ Transcript (.json)</span>
-            <input type="file" name="file" accept=".json" required class="block w-full text-sm">
-          </label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="border-2 border-dashed border-indigo-300 rounded-xl p-6 text-center bg-white">
+            <label class="cursor-pointer">
+              <span class="text-gray-700 font-medium block mb-3">อัปโหลดไฟล์ Transcript (.json)</span>
+              <input type="file" name="file" accept=".json" required class="block w-full text-sm">
+            </label>
+          </div>
+          <div class="border-2 border-dashed border-emerald-300 rounded-xl p-6 text-center bg-white">
+            <label class="cursor-pointer">
+              <span class="text-gray-700 font-medium block mb-3">อัปโหลดไฟล์ OCR Results (.json) (ไม่บังคับ)</span>
+              <input type="file" name="ocr_file" accept=".json" class="block w-full text-sm">
+            </label>
+            <p class="mt-2 text-xs text-gray-500">ใช้ไฟล์ `capture_ocr_results.json` เพื่อเพิ่มหลักฐาน OCR และรูปที่เกี่ยวข้องในรายงาน</p>
+          </div>
         </div>
 
         <div>

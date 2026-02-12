@@ -1,9 +1,13 @@
 import asyncio
+import base64
+import html as html_lib
 import json
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -116,6 +120,225 @@ def build_transcript_index(transcript: TranscriptJSON) -> Dict[int, str]:
         if tx:
             idx[i] = f"{sp}: {tx}"
     return idx
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            return default
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def clean_ocr_text_for_workflow(text: str, max_chars: int = 900) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"<page_number>\s*\d+\s*</page_number>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"PageNumber\s*=\s*\"[^\"]+\"", " ", value, flags=re.IGNORECASE)
+    value = value.replace("<br/>", "\n").replace("<br>", "\n")
+    value = re.sub(r"</?(table|tr|td|th|thead|tbody|ul|ol|li|strong|b|i|u|p|div|span)[^>]*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html_lib.unescape(value)
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    if len(value) > max_chars:
+        value = value[:max_chars].rsplit(" ", 1)[0].strip()
+    return value
+
+
+def similarity_ratio(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+
+def parse_ocr_results_for_workflow(
+    ocr_results: Dict[str, Any],
+    max_segments: int,
+    min_text_chars: int,
+    max_chars_per_segment: int,
+    dedupe_similarity: float,
+) -> Tuple[List[TranscriptSegment], List[Dict[str, Any]]]:
+    captures = list((ocr_results or {}).get("captures") or [])
+    captures.sort(key=lambda x: safe_float((x or {}).get("timestamp_sec"), 0.0) if isinstance(x, dict) else 0.0)
+    ocr_segments: List[TranscriptSegment] = []
+    accepted_captures: List[Dict[str, Any]] = []
+    accepted_texts: List[str] = []
+
+    for item in captures:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("ocr_error", "") or "").strip():
+            continue
+        if str(item.get("ocr_skipped_reason", "") or "").strip():
+            continue
+
+        text = clean_ocr_text_for_workflow(
+            str(item.get("ocr_text", "") or ""),
+            max_chars=max(80, int(max_chars_per_segment)),
+        )
+        if len(text) < max(1, int(min_text_chars)):
+            continue
+        if any(similarity_ratio(prev, text) >= dedupe_similarity for prev in accepted_texts):
+            continue
+
+        ts_sec = safe_float(item.get("timestamp_sec"), 0.0)
+        ts_hms = str(item.get("timestamp_hms", "") or "")
+        capture_idx = safe_int(item.get("capture_index"), 0)
+        segment_text = f"[OCR {ts_hms}] {text}" if ts_hms else f"[OCR] {text}"
+
+        ocr_segments.append(
+            TranscriptSegment(
+                speaker="SCREEN_OCR",
+                text=segment_text,
+                start=ts_sec,
+                end=ts_sec + 0.4,
+            )
+        )
+        accepted_captures.append(
+            {
+                "capture_index": capture_idx,
+                "timestamp_sec": ts_sec,
+                "timestamp_hms": ts_hms,
+                "image_path": str(item.get("image_path", "") or ""),
+                "ocr_text_clean": text,
+            }
+        )
+        accepted_texts.append(text)
+
+        if max_segments > 0 and len(ocr_segments) >= max_segments:
+            break
+
+    return ocr_segments, accepted_captures
+
+
+AGENDA_MATCH_STOPWORDS = {
+    "วาระ",
+    "ที่",
+    "เรื่อง",
+    "และ",
+    "ของ",
+    "ใน",
+    "กับ",
+    "การ",
+    "เพื่อ",
+    "งาน",
+    "รายงาน",
+    "ประชุม",
+    "บริษัท",
+    "จำกัด",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+}
+
+
+def agenda_match_tokens(text: str) -> List[str]:
+    toks = re.findall(r"[A-Za-z0-9ก-๙_]+", normalize_text(text))
+    out: List[str] = []
+    seen = set()
+    for tok in toks:
+        if len(tok) < 2:
+            continue
+        if tok in AGENDA_MATCH_STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def strip_html_tags(text: str) -> str:
+    if not text:
+        return ""
+    value = re.sub(r"<[^>]+>", " ", text)
+    value = html_lib.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def pick_related_ocr_capture_lists(
+    agendas: List[AgendaItem],
+    sections: List[str],
+    ocr_captures: List[Dict[str, Any]],
+    min_score: float = 6.0,
+    max_per_agenda: int = 3,
+    allow_reuse: bool = False,
+) -> Dict[int, List[Dict[str, Any]]]:
+    selected: Dict[int, List[Dict[str, Any]]] = {}
+    used_capture_ids = set()
+
+    for i, agenda in enumerate(agendas):
+        section_text = strip_html_tags(sections[i] if i < len(sections) else "")
+        query_source = section_text if len(section_text) >= 20 else " ".join([agenda.title] + (agenda.details or []))
+        query_tokens = set(agenda_match_tokens(query_source))
+        if not query_tokens:
+            query_tokens = set(agenda_match_tokens(" ".join([agenda.title] + (agenda.details or []))))
+        if not query_tokens:
+            continue
+
+        scored_caps: List[Dict[str, Any]] = []
+        for cap in ocr_captures:
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            if (not allow_reuse) and cap_id in used_capture_ids:
+                continue
+            txt = normalize_text(str(cap.get("ocr_text_clean", "") or ""))
+            if not txt:
+                continue
+            hits = [t for t in query_tokens if t in txt]
+            if not hits:
+                continue
+            score = float(sum(len(h) for h in hits))
+            if score < min_score:
+                continue
+            cap_copy = dict(cap)
+            cap_copy["match_score"] = score
+            cap_copy["matched_keywords"] = hits[:6]
+            scored_caps.append(cap_copy)
+
+        if not scored_caps:
+            continue
+
+        scored_caps.sort(
+            key=lambda x: (
+                safe_float(x.get("match_score"), 0.0),
+                safe_float(x.get("timestamp_sec"), 0.0),
+            ),
+            reverse=True,
+        )
+        cap_list: List[Dict[str, Any]] = []
+        max_keep = max(1, int(max_per_agenda))
+        for cap in scored_caps:
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            if (not allow_reuse) and cap_id in used_capture_ids:
+                continue
+            cap_list.append(cap)
+            if not allow_reuse:
+                used_capture_ids.add(cap_id)
+            if len(cap_list) >= max_keep:
+                break
+
+        if cap_list:
+            selected[i] = cap_list
+
+    return selected
 
 
 # =========================
@@ -460,6 +683,56 @@ Output JSON:
         ]
         resp = await self.client.generate(messages, temperature=0.0, completion_tokens=800)
         return try_parse_json(resp)
+
+
+class OcrAugmentAgent:
+    """
+    รับ capture_ocr_results.json จาก state แล้ว augment เข้า transcript
+    เพื่อให้ agent ถัดไปใช้เป็น evidence เสริมได้ทันที
+    """
+
+    def __init__(self):
+        # 0 = no explicit cap (filter only by min chars + dedupe)
+        # default keep conservative to avoid oversized prompts
+        self.max_segments = int(os.getenv("OCR_AUGMENT_MAX_SEGMENTS", "40"))
+        self.min_text_chars = int(os.getenv("OCR_AUGMENT_MIN_TEXT_CHARS", "60"))
+        self.max_chars_per_segment = int(os.getenv("OCR_AUGMENT_MAX_TEXT_CHARS", "900"))
+        self.dedupe_similarity = float(os.getenv("OCR_AUGMENT_DEDUPE_SIMILARITY", "0.90"))
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        ocr_raw = state.get("ocr_results_json")
+        if not isinstance(ocr_raw, dict):
+            state["ocr_captures"] = []
+            state["ocr_augmented_count"] = 0
+            return state
+
+        transcript = TranscriptJSON.model_validate(state["transcript_json"])
+        ocr_segments, ocr_captures = parse_ocr_results_for_workflow(
+            ocr_results=ocr_raw,
+            max_segments=max(0, self.max_segments),
+            min_text_chars=max(1, self.min_text_chars),
+            max_chars_per_segment=max(80, self.max_chars_per_segment),
+            dedupe_similarity=self.dedupe_similarity,
+        )
+        if not ocr_segments:
+            state["ocr_captures"] = []
+            state["ocr_augmented_count"] = 0
+            return state
+
+        merged_segments = list(transcript.segments) + list(ocr_segments)
+        merged_segments.sort(key=lambda s: safe_float(s.start, 0.0))
+        merged_transcript = TranscriptJSON(segments=merged_segments)
+
+        state["transcript_json"] = merged_transcript.model_dump()
+        state["transcript_index"] = build_transcript_index(merged_transcript)
+        state["ocr_captures"] = ocr_captures
+        state["ocr_augmented_count"] = len(ocr_segments)
+        logger.info(
+            "OCR augment: added %d segments (captures=%d)",
+            len(ocr_segments),
+            len(ocr_captures),
+        )
+        return state
 
 
 class ExtractorAgent:
@@ -907,6 +1180,8 @@ class GeneratorAgent:
         self.max_action_rows = int(os.getenv("GEN_MAX_ACTION_ROWS", "20"))
         self.min_evidence_ids = int(os.getenv("GEN_MIN_EVIDENCE_IDS", "12"))
         self.fallback_evidence_topk = int(os.getenv("GEN_FALLBACK_EVIDENCE_TOPK", "40"))
+        self.ocr_max_evidence_lines = int(os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "6"))
+        self.ocr_min_match_score = float(os.getenv("GEN_OCR_MIN_MATCH_SCORE", "8.0"))
 
         self.max_parallel = int(os.getenv("GEN_MAX_PARALLEL", "3"))
         self.keyword_stopwords = {
@@ -1107,6 +1382,40 @@ class GeneratorAgent:
             used += len(row) + 1
         return "\n".join(out_lines) if out_lines else "ไม่มีหลักฐานแบบ segment_ids ที่ผูกมา (ใช้เฉพาะสรุป topic/details/action/decision)"
 
+    def _collect_ocr_evidence_lines(self, agenda: AgendaItem, ocr_captures: List[Dict[str, Any]]) -> List[str]:
+        if not ocr_captures:
+            return []
+        query_tokens = self._agenda_query_tokens(agenda)
+        if not query_tokens:
+            return []
+
+        scored: List[Tuple[float, Dict[str, Any], List[str]]] = []
+        for cap in ocr_captures:
+            txt = normalize_text(str(cap.get("ocr_text_clean", "") or ""))
+            if not txt:
+                continue
+            hits = [t for t in query_tokens if t in txt]
+            if not hits:
+                continue
+            score = float(sum(len(h) for h in hits))
+            if score < self.ocr_min_match_score:
+                continue
+            scored.append((score, cap, hits[:5]))
+
+        if not scored:
+            return []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        lines: List[str] = []
+        for score, cap, hits in scored[: self.ocr_max_evidence_lines]:
+            ts_hms = str(cap.get("timestamp_hms", "") or "")
+            txt = str(cap.get("ocr_text_clean", "") or "").strip()
+            if len(txt) > 260:
+                txt = txt[:260].rstrip() + "..."
+            hit_text = ", ".join(hits) if hits else "-"
+            lines.append(f"[OCR {ts_hms}] score={score:.1f} kw={hit_text} | {txt}")
+        return lines
+
     def _build_outline_prompt(self, agenda: AgendaItem, agenda_data: Dict[str, Any], evidence_text: str) -> List[Dict[str, str]]:
         topics, actions, decisions = self._filter_agenda_data_for_scope(agenda, agenda_data)
 
@@ -1208,6 +1517,7 @@ EVIDENCE:
         agendas = parsed.agendas
 
         transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
 
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
@@ -1221,16 +1531,20 @@ EVIDENCE:
 
                 ids = self._collect_evidence_ids(ag, agenda_data, transcript_index)
                 evidence_text = self._build_evidence_text(transcript_index, ids)
+                ocr_lines = self._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
                 outline = await self._outline(ag, agenda_data, evidence_text)
 
                 messages = self._build_write_prompt(outline, evidence_text)
                 logger.info(
-                    "Generate %d/%d: agenda=%s (evidence_ids=%d, evidence_chars=%d)",
+                    "Generate %d/%d: agenda=%s (evidence_ids=%d, ocr_lines=%d, evidence_chars=%d)",
                     i + 1,
                     len(agendas),
                     ag.title,
                     len(ids),
+                    len(ocr_lines),
                     len(evidence_text),
                 )
                 resp = await self.client.generate(messages, temperature=0.2, completion_tokens=2200)
@@ -2395,11 +2709,30 @@ def route_react_decision(state: "MeetingState") -> str:
 
 
 class AssembleAgent:
+    def __init__(self):
+        self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "10.0"))
+        self.image_max_per_agenda = int(os.getenv("AGENDA_IMAGE_MAX_PER_AGENDA", "3"))
+        self.image_allow_reuse = str(os.getenv("AGENDA_IMAGE_ALLOW_REUSE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def __call__(self, state: "MeetingState") -> "MeetingState":
         parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
         header_lines = parsed.header_lines
         agendas = parsed.agendas
         sections = state["agenda_sections"]
+        ocr_captures = state.get("ocr_captures") or []
+        agenda_image_map = pick_related_ocr_capture_lists(
+            agendas=agendas,
+            sections=sections,
+            ocr_captures=ocr_captures,
+            min_score=self.image_min_match_score,
+            max_per_agenda=max(1, self.image_max_per_agenda),
+            allow_reuse=self.image_allow_reuse,
+        )
         attendees_html = self._format_attendees(state["attendees_text"])
         header_html = "<br>".join([f"<div>{h}</div>" for h in header_lines])
 
@@ -2423,6 +2756,9 @@ class AssembleAgent:
     th, td {{ border: 1px solid #000; padding: 6px 8px; text-align: left; vertical-align: top; }}
     th {{ background-color: #f5f5f5; font-weight: 700; }}
     blockquote {{ margin: 6px 0; padding: 6px 10px; border-left: 3px solid #888; background: #fafafa; }}
+    .agenda-image-wrap {{ margin: 10px 0 14px; border: 1px solid #d4d4d4; background: #fafafa; border-radius: 8px; overflow: hidden; }}
+    .agenda-image-wrap img {{ width: 100%; height: auto; display: block; background: #111; }}
+    .agenda-image-caption {{ font-size: 0.86em; color: #333; padding: 7px 10px; border-top: 1px solid #ddd; }}
     .footer {{ text-align: center; color: #333; font-size: 0.85em; margin-top: 28px; border-top: 1px solid #aaa; padding-top: 10px; }}
   </style>
   <title>รายงานการประชุม</title>
@@ -2434,14 +2770,52 @@ class AssembleAgent:
 """
         for i, ag in enumerate(agendas):
             final_html += f"<h3>{ag.title}</h3>\n"
-            final_html += f"<div>{sections[i]}</div>\n"
+            caps = agenda_image_map.get(i) or []
+            section_html = sections[i] if i < len(sections) else ""
+            section_html = self._inject_images_into_section(section_html, caps, i)
+            final_html += f"<div>{section_html}</div>\n"
 
         final_html += """
   <div class="footer">เอกสารสรุปรายงานการประชุม (อัตโนมัติ)</div>
 </body></html>
 """
         state["final_html"] = final_html
+        state["agenda_image_count"] = sum(len(x) for x in agenda_image_map.values())
         return state
+
+    def _inject_images_into_section(
+        self,
+        section_html: str,
+        captures: List[Dict[str, Any]],
+        agenda_index: int,
+    ) -> str:
+        if not captures:
+            return section_html
+
+        blocks = [self._build_agenda_image_block(c, agenda_index) for c in captures]
+        blocks = [b for b in blocks if b]
+        if not blocks:
+            return section_html
+
+        # Place images near actual section content: after each <h4> in order.
+        h4_matches = list(re.finditer(r"<h4[^>]*>.*?</h4>", section_html, flags=re.IGNORECASE | re.DOTALL))
+        if not h4_matches:
+            return "".join(blocks) + section_html
+
+        anchors = [m.end() for m in h4_matches]
+        insert_map: Dict[int, List[str]] = {}
+        for i, block in enumerate(blocks):
+            pos = anchors[min(i, len(anchors) - 1)]
+            insert_map.setdefault(pos, []).append(block)
+
+        out_parts: List[str] = []
+        cursor = 0
+        for pos in sorted(insert_map.keys()):
+            out_parts.append(section_html[cursor:pos])
+            out_parts.extend(insert_map[pos])
+            cursor = pos
+        out_parts.append(section_html[cursor:])
+        return "".join(out_parts)
 
     def _format_attendees(self, text: str) -> str:
         html = '<div class="attendees-box">'
@@ -2455,6 +2829,41 @@ class AssembleAgent:
         html += "</div>"
         return html
 
+    def _build_agenda_image_block(self, capture: Dict[str, Any], agenda_index: int) -> str:
+        image_path = self._resolve_image_path(str(capture.get("image_path", "") or ""))
+        if not image_path:
+            return ""
+
+        img_src = ""
+        try:
+            b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            img_src = f"data:image/jpeg;base64,{b64}"
+        except Exception:
+            img_src = html_lib.escape(str(image_path))
+
+        ts_hms = str(capture.get("timestamp_hms", "") or "")
+        score = float(capture.get("match_score", 0.0) or 0.0)
+        keywords = ", ".join(capture.get("matched_keywords", [])[:4]) if capture.get("matched_keywords") else "-"
+        caption = f"ภาพประกอบจาก OCR เวลา {ts_hms} | score={score:.1f} | keyword: {keywords}"
+        return (
+            '<div class="agenda-image-wrap">'
+            f'<img src="{img_src}" alt="agenda-{agenda_index+1}-ocr-image" loading="lazy"/>'
+            f'<div class="agenda-image-caption">{html_lib.escape(caption)}</div>'
+            "</div>\n"
+        )
+
+    def _resolve_image_path(self, image_path: str) -> Optional[Path]:
+        if not image_path:
+            return None
+        p = Path(image_path)
+        if p.exists():
+            return p
+        if not p.is_absolute():
+            alt = Path.cwd() / p
+            if alt.exists():
+                return alt
+        return None
+
 
 # =========================
 # LangGraph State
@@ -2464,6 +2873,9 @@ class MeetingState(TypedDict, total=False):
     agenda_text: str
     transcript_json: Dict[str, Any]
     transcript_index: Dict[int, str]
+    ocr_results_json: Dict[str, Any]
+    ocr_captures: List[Dict[str, Any]]
+    ocr_augmented_count: int
 
     parsed_agenda: Dict[str, Any]
     kg: Dict[str, Any]
@@ -2471,6 +2883,7 @@ class MeetingState(TypedDict, total=False):
     decisions: List[Dict[str, Any]]
 
     agenda_sections: List[str]
+    agenda_image_count: int
     final_html: str
 
     react_loop: int
@@ -2486,6 +2899,7 @@ def build_workflow() -> Any:
     graph = StateGraph(MeetingState)
 
     graph.add_node("parse_agenda", AgendaParserAgent(client))
+    graph.add_node("augment_with_ocr", OcrAugmentAgent())
     graph.add_node("extract_kg", ExtractorAgent(client))
     graph.add_node("link_events", LinkerAgent(client))
     graph.add_node("generate_sections", GeneratorAgent(client))
@@ -2494,7 +2908,8 @@ def build_workflow() -> Any:
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
-    graph.add_edge("parse_agenda", "extract_kg")
+    graph.add_edge("parse_agenda", "augment_with_ocr")
+    graph.add_edge("augment_with_ocr", "extract_kg")
     graph.add_edge("extract_kg", "link_events")
     graph.add_edge("link_events", "generate_sections")
     graph.add_edge("generate_sections", "validate_sections")
@@ -2513,6 +2928,7 @@ def build_workflow_react() -> Any:
     graph = StateGraph(MeetingState)
 
     graph.add_node("parse_agenda", AgendaParserAgent(client))
+    graph.add_node("augment_with_ocr", OcrAugmentAgent())
     graph.add_node("extract_kg", ExtractorAgent(client))
     graph.add_node("link_events", LinkerAgent(client))
     graph.add_node("generate_sections", GeneratorAgent(client))
@@ -2526,7 +2942,8 @@ def build_workflow_react() -> Any:
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
-    graph.add_edge("parse_agenda", "extract_kg")
+    graph.add_edge("parse_agenda", "augment_with_ocr")
+    graph.add_edge("augment_with_ocr", "extract_kg")
     graph.add_edge("extract_kg", "link_events")
     graph.add_edge("link_events", "generate_sections")
     graph.add_edge("generate_sections", "validate_sections")

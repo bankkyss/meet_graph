@@ -19,14 +19,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import concurrent.futures
 import html
 import json
+import logging
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -506,7 +517,7 @@ async def rewrite_sections_official_async(
     config: Dict[str, Any],
     completion_tokens: int = 2400,
 ) -> Tuple[str, int]:
-    from meeting_minutes_graphrag_fastapi import TyphoonClient
+    from services.meeting_workflow import TyphoonClient
 
     agendas = list(parsed.agendas)
     blocks = extract_agenda_blocks(final_html, agendas)
@@ -517,9 +528,11 @@ async def rewrite_sections_official_async(
     references = build_reference_context(config, parsed)
 
     rewritten_by_index: Dict[int, str] = {}
+    total_blocks = len(blocks)
 
     for i, block in enumerate(blocks):
         _, _, _, _, heading_title, body_html = block
+        print(f"[official-editor] {i+1}/{total_blocks} {heading_title}", flush=True)
         agenda = agendas[i] if i < len(agendas) else None
         if agenda is None:
             continue
@@ -560,9 +573,36 @@ async def rewrite_sections_official_async(
     return "".join(rebuilt_parts), rewrite_count
 
 
-def run_react_workflow(config: Dict[str, Any], transcript_raw: Dict[str, Any]) -> Tuple[str, Any, Any]:
+def run_react_workflow_with_progress(
+    config: Dict[str, Any],
+    transcript_raw: Dict[str, Any],
+    ocr_results_raw: Optional[Dict[str, Any]] = None,
+    heartbeat_sec: int = 10,
+) -> Tuple[str, Any, Any, Dict[str, Any]]:
+    start_ts = time.time()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = executor.submit(run_react_workflow, config, transcript_raw, ocr_results_raw)
     try:
-        from meeting_minutes_graphrag_fastapi import (
+        while True:
+            try:
+                return fut.result(timeout=max(1, int(heartbeat_sec)))
+            except concurrent.futures.TimeoutError:
+                pass
+    except KeyboardInterrupt:
+        print("\n[interrupt] workflow interrupted by user", flush=True)
+        fut.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def run_react_workflow(
+    config: Dict[str, Any],
+    transcript_raw: Dict[str, Any],
+    ocr_results_raw: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Any, Any, Dict[str, Any]]:
+    try:
+        from services.meeting_workflow import (
             ParsedAgenda,
             TranscriptJSON,
             WORKFLOW_REACT,
@@ -582,14 +622,35 @@ def run_react_workflow(config: Dict[str, Any], transcript_raw: Dict[str, Any]) -
         "transcript_json": transcript.model_dump(),
         "transcript_index": build_transcript_index(transcript),
     }
+    if isinstance(ocr_results_raw, dict):
+        init_state["ocr_results_json"] = ocr_results_raw
 
-    out = asyncio.run(WORKFLOW_REACT.ainvoke(init_state))
+    async def _run_with_updates() -> Dict[str, Any]:
+        merged: Dict[str, Any] = dict(init_state)
+        step_no = 0
+        if hasattr(WORKFLOW_REACT, "astream"):
+            async for ev in WORKFLOW_REACT.astream(init_state, stream_mode="updates"):
+                if not isinstance(ev, dict):
+                    continue
+                for node_name, patch in ev.items():
+                    step_no += 1
+                    if isinstance(patch, dict):
+                        merged.update(patch)
+                        keys = list(patch.keys())
+                        key_preview = ", ".join(keys[:5]) + (", ..." if len(keys) > 5 else "")
+                        print(f"[node] {step_no:02d} {node_name} done keys=[{key_preview}]", flush=True)
+                    else:
+                        print(f"[node] {step_no:02d} {node_name} done", flush=True)
+            return merged
+        return await WORKFLOW_REACT.ainvoke(init_state)
+
+    out = asyncio.run(_run_with_updates())
     final_html = str(out.get("final_html", "") or "")
     parsed = ParsedAgenda.model_validate(out.get("parsed_agenda", {}))
     if not final_html:
         raise RuntimeError("WORKFLOW_REACT returned empty final_html")
 
-    return final_html, parsed, transcript
+    return final_html, parsed, transcript, out
 
 
 def main() -> None:
@@ -598,14 +659,21 @@ def main() -> None:
     parser.add_argument("--transcript", default="data/transcript_2025-01-04.json")
     parser.add_argument("--video", default="data/video1862407925.mp4")
     parser.add_argument("--output-dir", default="test_flow_output")
-    parser.add_argument("--skip-official-editor", action="store_true")
+    parser.add_argument("--skip-official-editor", action="store_true", help="Skip extra local official-editor pass.")
+    parser.add_argument(
+        "--force-second-official-editor",
+        action="store_true",
+        help="Force an extra local official-editor pass even though WORKFLOW_REACT already has official_editor node.",
+    )
     parser.add_argument("--editor-completion-tokens", type=int, default=2400)
     parser.add_argument("--with-images", action="store_true", help="Attach video frames into HTML")
+    parser.add_argument("--ocr-json", default="", help="Path to capture_ocr_results.json (optional)")
     args = parser.parse_args()
 
     config_path = Path(args.config)
     transcript_path = Path(args.transcript)
     video_path = Path(args.video)
+    ocr_path = Path(args.ocr_json) if str(args.ocr_json or "").strip() else None
     output_root = Path(args.output_dir)
 
     if args.with_images and not video_path.exists():
@@ -613,23 +681,56 @@ def main() -> None:
 
     config = load_json(config_path)
     transcript_raw = load_json(transcript_path)
+    ocr_raw: Optional[Dict[str, Any]] = None
+    if ocr_path is not None:
+        ocr_raw = load_json(ocr_path)
+        if not isinstance(ocr_raw, dict):
+            raise ValueError("OCR JSON must be an object")
+        captures = ocr_raw.get("captures")
+        if captures is not None and not isinstance(captures, list):
+            raise ValueError("OCR JSON field `captures` must be a list")
     if not str(config.get("MEETING_INFO", "")).strip() or not str(config.get("AGENDA_TEXT", "")).strip():
         raise ValueError("Config must contain MEETING_INFO and AGENDA_TEXT")
 
     print("Running WORKFLOW_REACT...")
-    final_html, parsed, transcript = run_react_workflow(config, transcript_raw)
+    try:
+        final_html, parsed, transcript, out_state = run_react_workflow_with_progress(
+            config=config,
+            transcript_raw=transcript_raw,
+            ocr_results_raw=ocr_raw,
+        )
+    except KeyboardInterrupt:
+        print("Stopped.")
+        return
 
-    rewritten_count = 0
-    if not args.skip_official_editor:
-        print("Running official editor pass (formal style + references + few-shot)...")
-        final_html, rewritten_count = asyncio.run(
-            rewrite_sections_official_async(
-                final_html=final_html,
-                parsed=parsed,
-                transcript=transcript,
-                config=config,
-                completion_tokens=max(1200, int(args.editor_completion_tokens)),
+    workflow_official_rewritten_count = int(out_state.get("official_rewritten_count", 0) or 0)
+    extra_rewritten_count = 0
+    run_extra_editor = (
+        not args.skip_official_editor
+        and (
+            args.force_second_official_editor
+            or workflow_official_rewritten_count <= 0
+        )
+    )
+    if run_extra_editor:
+        print("Running extra local official editor pass (formal style + references + few-shot)...")
+        try:
+            final_html, extra_rewritten_count = asyncio.run(
+                rewrite_sections_official_async(
+                    final_html=final_html,
+                    parsed=parsed,
+                    transcript=transcript,
+                    config=config,
+                    completion_tokens=max(1200, int(args.editor_completion_tokens)),
+                )
             )
+        except Exception as e:
+            print(f"[warn] extra local official-editor failed: {e}")
+            print("[warn] keep workflow output as-is.")
+    elif not args.skip_official_editor and workflow_official_rewritten_count > 0:
+        print(
+            "[info] skip extra local official-editor pass because WORKFLOW_REACT already rewrote sections. "
+            "Use --force-second-official-editor to run it anyway."
         )
 
     run_id = now_ts()
@@ -639,7 +740,11 @@ def main() -> None:
 
     frame_files: Dict[int, str] = {}
     injected_count = 0
-    if args.with_images:
+    use_post_video_images = bool(args.with_images and ocr_raw is None)
+    if args.with_images and ocr_raw is not None:
+        print("[info] OCR JSON provided; skip --with-images post-injection because workflow already embeds OCR-linked images.")
+
+    if use_post_video_images:
         frame_points = pick_frame_points(parsed, transcript)
         frame_files = extract_frames(video_path, frame_points, frames_dir)
         html_name = f"Meeting_Report_ReAct_with_video_{run_id}.html"
@@ -648,16 +753,19 @@ def main() -> None:
         html_name = f"Meeting_Report_ReAct_official_{run_id}.html"
 
     html_path = run_dir / html_name
-    if args.with_images:
+    if use_post_video_images:
         final_html, injected_count = inject_images_into_html(final_html, parsed, frame_points, frame_files, html_path)
     html_path.write_text(final_html, encoding="utf-8")
 
     print(f"Created HTML: {html_path}")
     print(f"Frames folder: {frames_dir}")
     print(f"Agenda count: {len(parsed.agendas)}")
-    print(f"Officially rewritten sections: {rewritten_count}")
+    print(f"Officially rewritten sections (workflow): {workflow_official_rewritten_count}")
+    print(f"Officially rewritten sections (extra local pass): {extra_rewritten_count}")
     print(f"Extracted frames: {len(frame_files)}")
     print(f"Injected images in HTML: {injected_count}")
+    print(f"OCR augmented segments: {int(out_state.get('ocr_augmented_count', 0) or 0)}")
+    print(f"OCR-linked agenda images: {int(out_state.get('agenda_image_count', 0) or 0)}")
 
 
 if __name__ == "__main__":

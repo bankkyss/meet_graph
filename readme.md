@@ -15,7 +15,7 @@
 ## Techniques ที่ใช้
 
 1. **LangGraph Multi-Agent Orchestration**
-- `parse_agenda -> extract_kg -> link_events -> generate_sections -> validate_sections -> compliance_sections -> assemble`
+- `parse_agenda -> augment_with_ocr -> extract_kg -> link_events -> generate_sections -> validate_sections -> compliance_sections -> assemble`
 - สำหรับ ReAct เพิ่ม loop ตรวจแก้:
   `react_prepare -> react_critic -> react_decide -> react_revise (loop)`
 
@@ -51,7 +51,13 @@
 6. **Local ReAct Runner (`test_flow.py`)**
 - รัน `WORKFLOW_REACT` ตรงจากไฟล์ input
 - มี official editor pass เช่นเดียวกับ endpoint
-- เลือกได้ว่าจะใส่รูปจากวิดีโอหรือไม่ (`--with-images`)
+- รองรับ OCR JSON ตรงด้วย `--ocr-json path/to/capture_ocr_results.json`
+- เลือกได้ว่าจะใส่รูปจากวิดีโอหรือไม่ (`--with-images`, ใช้เมื่อไม่ได้ส่ง `--ocr-json`)
+
+7. **OCR Augmentation + Agenda Image Injection**
+- รับไฟล์ `capture_ocr_results.json` เข้า workflow โดยตรง
+- แปลง OCR เป็น segment speaker `SCREEN_OCR` เพื่อเพิ่มหลักฐานให้การสรุป
+- จับคู่ OCR capture กับวาระ แล้วแทรกรูปประกอบในรายงาน HTML อัตโนมัติ
 
 ## LangGraph Multi-Agent Detail
 
@@ -60,6 +66,7 @@
 | Node | Agent | หน้าที่หลัก |
 |---|---|---|
 | `parse_agenda` | `AgendaParserAgent` | แปลง `agenda_text` เป็นโครงสร้างวาระ (`ParsedAgenda`) |
+| `augment_with_ocr` | `OcrAugmentAgent` | รับ `capture_ocr_results.json`, merge OCR เข้า transcript และเตรียม metadata รูป |
 | `extract_kg` | `ExtractorAgent` | สกัด `speaker/topic/action/decision` จาก transcript แบบ chunk และรวมเข้า KG |
 | `link_events` | `LinkerAgent` | จับคู่ `actions/decisions` กับวาระที่ถูกต้องและอัปเดตความสัมพันธ์ในกราฟ |
 | `generate_sections` | `GeneratorAgent` | ดึง evidence ต่อวาระจากกราฟแล้วเขียน section (outline -> html fragment) |
@@ -71,6 +78,7 @@
 
 | Node | Agent | หน้าที่หลัก |
 |---|---|---|
+| `augment_with_ocr` | `OcrAugmentAgent` | ทำ OCR augmentation ก่อนเริ่ม extract/link/generate |
 | `react_prepare` | `ReActPrepareAgent` | เตรียม state สำหรับ loop (checklist map, loop counters) |
 | `react_critic` | `ReActCriticAgent` | ประเมินแต่ละวาระด้วย tool checks (structure/coverage/off-scope) |
 | `react_decide` | `ReActDecideAgent` | จุดตัดสินใจว่าจะ `done` หรือ `revise` |
@@ -87,10 +95,12 @@
 ## Endpoints
 
 ### `POST /generate`
-ใช้ Standard workflow (เร็วกว่า, ไม่มี ReAct loop)
+ใช้ Standard workflow (เร็วกว่า, ไม่มี ReAct loop) และรองรับไฟล์ OCR เพิ่มเติมแบบ optional:
+- `file`: transcript `.json` (required)
+- `ocr_file`: `capture_ocr_results.json` (optional)
 
 ### `POST /generate_react`
-ใช้ ReAct workflow + Official Editor pass (ภาษาทางการกว่า)
+ใช้ ReAct workflow + Official Editor pass (ภาษาทางการกว่า) และรองรับ `ocr_file` แบบ optional เช่นเดียวกัน
 
 ### `GET /jobs/{job_id}`
 เช็คสถานะงาน background (`queued/running/succeeded/failed`)
@@ -146,6 +156,80 @@ source .venv/bin/activate
   --transcript data/transcript_2025-01-04.json \
   --video data/video1862407925.mp4 \
   --with-images
+```
+
+## Video Change Capture + OCR
+
+สคริปต์ `video_change_ocr.py` ใช้สำหรับ:
+- อ่านวิดีโอแบบ sampling
+- ตรวจจับ "ภาพเปลี่ยน" ด้วย hybrid score (`pixel change ratio` + `histogram delta`)
+- บันทึกเฉพาะเฟรมที่เปลี่ยน และส่งเข้า Typhoon OCR
+
+ตัวอย่างรัน:
+```bash
+.venv/bin/python video_change_ocr.py \
+  --video data/video1862407925.mp4 \
+  --output-dir output/video_change_ocr \
+  --sample-every-sec 30 \
+  --sampling-mode seek \
+  --ocr-resize-width 960 \
+  --max-tokens 1024 \
+  --ocr-workers 4 \
+  --max-captures 20
+```
+
+ผลลัพธ์จะถูกเก็บในโฟลเดอร์ `output/video_change_ocr/run_<timestamp>/`:
+- `captures/*.jpg` เฟรมที่ถูกจับ
+- `capture_ocr_results.json` metadata + OCR รายเฟรม
+- `capture_ocr_compact.txt` รวมข้อความ OCR แบบตัดซ้ำ
+
+หมายเหตุ:
+- มี progress bar ระหว่าง scan วิดีโอและ OCR
+- ปิด progress bar ได้ด้วย `--no-progress`
+- default ใช้ `--sampling-mode auto` (ช่วง sampling ห่างมากจะเลือก `seek` ให้อัตโนมัติ)
+- เลือกโหมดได้ด้วย `--sampling-mode {grab,read,seek,auto}`
+- default `max_tokens` ปรับลดเป็น `2048` เพื่อให้ OCR ตอบเร็วขึ้น
+- default จะย่อภาพก่อนส่ง OCR (`--ocr-resize-width 1280`) ลดขนาดไฟล์อัปโหลด
+- สามารถกรองภาพซ้ำก่อน OCR ด้วย `--ocr-dhash-min-distance` (default `4`)
+- log ต่อภาพจะแสดง `status / latency / file size`
+- ใน `capture_ocr_results.json` มีฟิลด์ `ocr_status_code`, `ocr_latency_sec`, `ocr_file_size_bytes`
+
+## เชื่อมเข้า Multi-Agent เดิม
+
+รองรับการส่ง `capture_ocr_results.json` เข้า workflow โดยตรง ไม่ต้อง merge transcript ก่อน
+
+1) สร้าง OCR result จากวิดีโอ
+```bash
+.venv/bin/python video_change_ocr.py \
+  --video data/video1862407925.mp4 \
+  --output-dir output/video_change_ocr \
+  --sample-every-sec 30 \
+  --sampling-mode auto
+```
+
+2) รัน local workflow โดยส่ง OCR JSON ตรง
+```bash
+.venv/bin/python test_flow.py \
+  --config data/config_2025-01-04.json \
+  --transcript data/transcript_2025-01-04.json \
+  --ocr-json output/video_change_ocr/run_20260212_154613/capture_ocr_results.json
+```
+
+3) หรือเรียก API โดยแนบทั้ง transcript + OCR ใน multipart
+```bash
+curl -X POST "http://127.0.0.1:8011/generate_react" \
+  -F "attendees_text=<ใส่ข้อความรายชื่อผู้เข้าประชุม>" \
+  -F "agenda_text=<ใส่ข้อความวาระ>" \
+  -F "file=@data/transcript_2025-01-04.json;type=application/json" \
+  -F "ocr_file=@output/video_change_ocr/run_20260212_154613/capture_ocr_results.json;type=application/json"
+```
+
+4) (Legacy) ถ้าต้องการ merge เป็น transcript ไฟล์เดียว ยังใช้ `merge_ocr_into_transcript.py` ได้
+```bash
+.venv/bin/python merge_ocr_into_transcript.py \
+  --transcript data/transcript_2025-01-04.json \
+  --ocr-json output/video_change_ocr/run_20260212_154613/capture_ocr_results.json \
+  --output output/transcript_with_ocr.json
 ```
 
 ## Key Config (Environment Variables)

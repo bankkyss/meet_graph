@@ -6,6 +6,7 @@ config:
 graph TD;
 	__start__([<p>__start__</p>]):::first
 	parse_agenda(parse_agenda)
+	augment_with_ocr(augment_with_ocr)
 	extract_kg(extract_kg)
 	link_events(link_events)
 	generate_sections(generate_sections)
@@ -14,11 +15,12 @@ graph TD;
 	assemble(assemble)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> parse_agenda;
+	augment_with_ocr --> extract_kg;
 	compliance_sections --> assemble;
 	extract_kg --> link_events;
 	generate_sections --> validate_sections;
 	link_events --> generate_sections;
-	parse_agenda --> extract_kg;
+	parse_agenda --> augment_with_ocr;
 	validate_sections --> compliance_sections;
 	assemble --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2

@@ -18,7 +18,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -85,6 +85,7 @@ async def _generate_with_workflow(
     attendees_text: str = Form(...),
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
+    ocr_file: Optional[UploadFile] = File(None),
 ):
     if not os.getenv("TYPHOON_API_KEY"):
         raise HTTPException(status_code=500, detail="Missing TYPHOON_API_KEY")
@@ -103,12 +104,30 @@ async def _generate_with_workflow(
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"โครงสร้าง transcript ไม่ถูกต้อง: {str(e)}")
 
+    ocr_raw: Optional[dict] = None
+    if ocr_file is not None and (ocr_file.filename or "").strip():
+        if not (ocr_file.filename or "").endswith(".json"):
+            raise HTTPException(status_code=400, detail="ไฟล์ OCR ต้องเป็น .json")
+        try:
+            ocr_content = await ocr_file.read()
+            ocr_candidate = json.loads(ocr_content.decode("utf-8"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"ไฟล์ OCR JSON ไม่ถูกต้อง: {str(e)}")
+        if not isinstance(ocr_candidate, dict):
+            raise HTTPException(status_code=400, detail="ไฟล์ OCR JSON ต้องเป็น object")
+        captures = ocr_candidate.get("captures")
+        if captures is not None and not isinstance(captures, list):
+            raise HTTPException(status_code=400, detail="ไฟล์ OCR JSON field `captures` ต้องเป็น list")
+        ocr_raw = ocr_candidate
+
     init_state: MeetingState = {
         "attendees_text": attendees_text,
         "agenda_text": agenda_text,
         "transcript_json": transcript.model_dump(),
         "transcript_index": build_transcript_index(transcript),
     }
+    if ocr_raw is not None:
+        init_state["ocr_results_json"] = ocr_raw
     return await JOB_SERVICE.create_and_start(
         workflow=workflow,
         workflow_tag=workflow_tag,
@@ -122,6 +141,7 @@ async def generate_report(
     attendees_text: str = Form(...),
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
+    ocr_file: Optional[UploadFile] = File(None),
 ):
     return await _generate_with_workflow(
         workflow=WORKFLOW,
@@ -130,6 +150,7 @@ async def generate_report(
         attendees_text=attendees_text,
         agenda_text=agenda_text,
         file=file,
+        ocr_file=ocr_file,
     )
 
 
@@ -138,6 +159,7 @@ async def generate_report_react(
     attendees_text: str = Form(...),
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
+    ocr_file: Optional[UploadFile] = File(None),
 ):
     return await _generate_with_workflow(
         workflow=WORKFLOW_REACT,
@@ -146,6 +168,7 @@ async def generate_report_react(
         attendees_text=attendees_text,
         agenda_text=agenda_text,
         file=file,
+        ocr_file=ocr_file,
     )
 
 
