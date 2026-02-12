@@ -619,7 +619,7 @@ def main() -> None:
         default=1280,
         help="Resize captured image before OCR upload (0 means original frame size).",
     )
-    parser.add_argument("--max-captures", type=int, default=40)
+    parser.add_argument("--max-captures", type=int, default=60)
     parser.add_argument("--jpeg-quality", type=int, default=88)
 
     parser.add_argument("--skip-ocr", action="store_true")
@@ -631,7 +631,7 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.6)
     parser.add_argument("--repetition-penalty", type=float, default=1.2)
     parser.add_argument("--pages", default="")
-    parser.add_argument("--request-timeout", type=float, default=45.0)
+    parser.add_argument("--request-timeout", type=float, default=70.0)
     parser.add_argument("--max-retries", type=int, default=0)
     parser.add_argument("--retry-backoff-sec", type=float, default=2.0)
     parser.add_argument("--ocr-workers", type=int, default=3)

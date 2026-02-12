@@ -3,8 +3,10 @@ import base64
 import html as html_lib
 import json
 import logging
+import math
 import os
 import re
+from collections import Counter
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
@@ -265,6 +267,33 @@ def agenda_match_tokens(text: str) -> List[str]:
     return out
 
 
+def agenda_match_token_bag(text: str) -> List[str]:
+    toks = re.findall(r"[A-Za-z0-9ก-๙_]+", normalize_text(text))
+    out: List[str] = []
+    for tok in toks:
+        if len(tok) < 2:
+            continue
+        if tok in AGENDA_MATCH_STOPWORDS:
+            continue
+        out.append(tok)
+    return out
+
+
+def cosine_sim_token_bags(a_tokens: List[str], b_tokens: List[str]) -> float:
+    if not a_tokens or not b_tokens:
+        return 0.0
+    ca = Counter(a_tokens)
+    cb = Counter(b_tokens)
+    dot = float(sum(float(ca[k]) * float(cb.get(k, 0)) for k in ca.keys()))
+    if dot <= 0.0:
+        return 0.0
+    norm_a = math.sqrt(sum(float(v * v) for v in ca.values()))
+    norm_b = math.sqrt(sum(float(v * v) for v in cb.values()))
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def strip_html_tags(text: str) -> str:
     if not text:
         return ""
@@ -274,62 +303,227 @@ def strip_html_tags(text: str) -> str:
     return value
 
 
+def section_kind_from_title(title: str) -> str:
+    t = normalize_text(title)
+    if ("action" in t) or ("ดำเนินการ" in t):
+        return "actions"
+    if ("มติ" in t) or ("decision" in t):
+        return "decisions"
+    if ("ติดตาม" in t) or ("followup" in t):
+        return "followup"
+    return "summary"
+
+
+def extract_section_anchors(section_html: str) -> List[Dict[str, Any]]:
+    text = section_html or ""
+    h4_matches = list(re.finditer(r"<h4[^>]*>(.*?)</h4>", text, flags=re.IGNORECASE | re.DOTALL))
+    anchors: List[Dict[str, Any]] = []
+    if not h4_matches:
+        body_text = strip_html_tags(text)
+        anchors.append(
+            {
+                "anchor_index": 0,
+                "anchor_title": "เนื้อหา",
+                "anchor_kind": "summary",
+                "anchor_text": body_text[:1200],
+            }
+        )
+        return anchors
+
+    for i, m in enumerate(h4_matches):
+        title = strip_html_tags(m.group(1)) or f"section_{i+1}"
+        body_start = m.end()
+        body_end = h4_matches[i + 1].start() if i + 1 < len(h4_matches) else len(text)
+        body_html = text[body_start:body_end]
+        body_text = strip_html_tags(body_html)
+        anchors.append(
+            {
+                "anchor_index": i,
+                "anchor_title": title,
+                "anchor_kind": section_kind_from_title(title),
+                "anchor_text": body_text[:1200],
+            }
+        )
+    return anchors
+
+
+def agenda_graph_context_by_kind(agenda_data: Dict[str, Any]) -> Dict[str, str]:
+    topics = agenda_data.get("topics") or []
+    actions = agenda_data.get("actions") or []
+    decisions = agenda_data.get("decisions") or []
+
+    topic_text = " ".join(
+        (f"{t.get('title', '')} {t.get('details', '')} {' '.join(t.get('evidence') or [])}")[:450]
+        for t in topics[:14]
+        if isinstance(t, dict)
+    )
+    action_text = " ".join(
+        (f"{a.get('description', '')} {' '.join(a.get('related_topics') or [])} {a.get('evidence', '')}")[:320]
+        for a in actions[:18]
+        if isinstance(a, dict)
+    )
+    decision_text = " ".join(
+        (f"{d.get('description', '')} {' '.join(d.get('related_topics') or [])} {d.get('evidence', '')}")[:320]
+        for d in decisions[:18]
+        if isinstance(d, dict)
+    )
+    return {
+        "summary": f"{topic_text} {action_text} {decision_text}".strip(),
+        "followup": f"{topic_text} {action_text}".strip(),
+        "actions": action_text.strip(),
+        "decisions": decision_text.strip(),
+    }
+
+
+def keyword_overlap_score(query_tokens: set, cap_tokens: set) -> Tuple[float, List[str], float, float]:
+    if not query_tokens or not cap_tokens:
+        return 0.0, [], 0.0, 0.0
+    hits = sorted([t for t in cap_tokens if t in query_tokens], key=len, reverse=True)
+    if not hits:
+        return 0.0, [], 0.0, 0.0
+    hit_count = float(len(hits))
+    coverage = hit_count / max(1.0, float(len(query_tokens)))
+    jaccard = hit_count / max(1.0, float(len(query_tokens | cap_tokens)))
+    score = (hit_count * 10.0) + (coverage * 20.0) + (jaccard * 8.0)
+    return score, hits, coverage, jaccard
+
+
 def pick_related_ocr_capture_lists(
     agendas: List[AgendaItem],
     sections: List[str],
     ocr_captures: List[Dict[str, Any]],
-    min_score: float = 6.0,
+    agenda_graph_data: Optional[List[Dict[str, Any]]] = None,
+    min_score: float = 10.0,
+    min_hit_tokens: int = 2,
     max_per_agenda: int = 3,
+    max_per_anchor: int = 1,
+    scoring_mode: str = "keyword",  # keyword | cosine | hybrid
+    min_cosine_anchor: float = 0.15,
+    min_cosine_context: float = 0.05,
     allow_reuse: bool = False,
 ) -> Dict[int, List[Dict[str, Any]]]:
     selected: Dict[int, List[Dict[str, Any]]] = {}
     used_capture_ids = set()
+    mode = str(scoring_mode or "keyword").strip().lower()
+    if mode not in {"keyword", "cosine", "hybrid"}:
+        mode = "keyword"
 
     for i, agenda in enumerate(agendas):
+        agenda_data = (agenda_graph_data[i] if agenda_graph_data and i < len(agenda_graph_data) else {}) or {}
         section_text = strip_html_tags(sections[i] if i < len(sections) else "")
-        query_source = section_text if len(section_text) >= 20 else " ".join([agenda.title] + (agenda.details or []))
-        query_tokens = set(agenda_match_tokens(query_source))
-        if not query_tokens:
-            query_tokens = set(agenda_match_tokens(" ".join([agenda.title] + (agenda.details or []))))
+        base_query = " ".join([agenda.title] + (agenda.details or []))
+        graph_ctx = agenda_graph_context_by_kind(agenda_data)
+        query_source = " ".join([base_query, section_text[:1400], graph_ctx.get("summary", "")])
+        query_bag = agenda_match_token_bag(query_source)
+        query_tokens = set(query_bag)
         if not query_tokens:
             continue
 
-        scored_caps: List[Dict[str, Any]] = []
+        anchors = extract_section_anchors(sections[i] if i < len(sections) else "")
+        anchor_token_map: Dict[int, set] = {}
+        anchor_bag_map: Dict[int, List[str]] = {}
+        for anchor in anchors:
+            anchor_idx = safe_int(anchor.get("anchor_index"), 0)
+            anchor_kind = str(anchor.get("anchor_kind", "summary") or "summary")
+            anchor_title = str(anchor.get("anchor_title", "") or "")
+            anchor_text = str(anchor.get("anchor_text", "") or "")
+            anchor_query = " ".join(
+                [
+                    base_query,
+                    anchor_title,
+                    anchor_text,
+                    graph_ctx.get(anchor_kind, ""),
+                ]
+            )
+            anchor_bag = agenda_match_token_bag(anchor_query)
+            anchor_token_map[anchor_idx] = set(anchor_bag)
+            anchor_bag_map[anchor_idx] = anchor_bag
+
+        candidates: List[Dict[str, Any]] = []
         for cap in ocr_captures:
             cap_id = safe_int(cap.get("capture_index"), 0)
             if (not allow_reuse) and cap_id in used_capture_ids:
                 continue
-            txt = normalize_text(str(cap.get("ocr_text_clean", "") or ""))
-            if not txt:
+            cap_text = str(cap.get("ocr_text_clean", "") or "")
+            cap_bag = agenda_match_token_bag(cap_text)
+            cap_tokens = set(cap_bag)
+            if not cap_tokens:
                 continue
-            hits = [t for t in query_tokens if t in txt]
-            if not hits:
-                continue
-            score = float(sum(len(h) for h in hits))
-            if score < min_score:
-                continue
-            cap_copy = dict(cap)
-            cap_copy["match_score"] = score
-            cap_copy["matched_keywords"] = hits[:6]
-            scored_caps.append(cap_copy)
 
-        if not scored_caps:
+            best_candidate: Optional[Dict[str, Any]] = None
+            for anchor in anchors:
+                anchor_idx = safe_int(anchor.get("anchor_index"), 0)
+                anchor_tokens = anchor_token_map.get(anchor_idx) or set()
+                if not anchor_tokens:
+                    continue
+
+                score_anchor, hits_anchor, cov_anchor, jac_anchor = keyword_overlap_score(anchor_tokens, cap_tokens)
+                score_ctx, hits_ctx, cov_ctx, jac_ctx = keyword_overlap_score(query_tokens, cap_tokens)
+                cos_anchor = cosine_sim_token_bags(anchor_bag_map.get(anchor_idx) or [], cap_bag)
+                cos_ctx = cosine_sim_token_bags(query_bag, cap_bag)
+                all_hits = list(dict.fromkeys(hits_anchor + hits_ctx))
+
+                if mode == "keyword":
+                    if len(hits_anchor) < max(1, int(min_hit_tokens)):
+                        continue
+                    score = (1.0 * score_anchor) + (0.45 * score_ctx)
+                elif mode == "cosine":
+                    if cos_anchor < max(0.0, float(min_cosine_anchor)):
+                        continue
+                    if cos_ctx < max(0.0, float(min_cosine_context)):
+                        continue
+                    score = (cos_anchor * 100.0) + (cos_ctx * 40.0)
+                else:  # hybrid
+                    if (len(hits_anchor) < max(1, int(min_hit_tokens))) and (cos_anchor < max(0.0, float(min_cosine_anchor))):
+                        continue
+                    score = (0.65 * ((1.0 * score_anchor) + (0.45 * score_ctx))) + (cos_anchor * 30.0) + (cos_ctx * 12.0)
+
+                if score < min_score:
+                    continue
+
+                cand = dict(cap)
+                cand["match_score"] = score
+                cand["matched_keywords"] = all_hits[:8]
+                cand["match_mode"] = mode
+                cand["match_hit_count"] = len(hits_anchor)
+                cand["match_anchor_coverage"] = cov_anchor
+                cand["match_anchor_jaccard"] = jac_anchor
+                cand["match_context_coverage"] = cov_ctx
+                cand["match_context_jaccard"] = jac_ctx
+                cand["match_anchor_cosine"] = cos_anchor
+                cand["match_context_cosine"] = cos_ctx
+                cand["anchor_index"] = anchor_idx
+                cand["anchor_title"] = str(anchor.get("anchor_title", "") or "")
+                if (best_candidate is None) or (score > safe_float(best_candidate.get("match_score"), 0.0)):
+                    best_candidate = cand
+
+            if best_candidate is None:
+                continue
+            candidates.append(best_candidate)
+
+        if not candidates:
             continue
 
-        scored_caps.sort(
+        candidates.sort(
             key=lambda x: (
                 safe_float(x.get("match_score"), 0.0),
                 safe_float(x.get("timestamp_sec"), 0.0),
             ),
             reverse=True,
         )
+
         cap_list: List[Dict[str, Any]] = []
         max_keep = max(1, int(max_per_agenda))
-        for cap in scored_caps:
+        per_anchor_counter: Dict[int, int] = {}
+        for cap in candidates:
             cap_id = safe_int(cap.get("capture_index"), 0)
             if (not allow_reuse) and cap_id in used_capture_ids:
                 continue
+            anchor_idx = safe_int(cap.get("anchor_index"), 0)
+            if per_anchor_counter.get(anchor_idx, 0) >= max(1, int(max_per_anchor)):
+                continue
             cap_list.append(cap)
+            per_anchor_counter[anchor_idx] = per_anchor_counter.get(anchor_idx, 0) + 1
             if not allow_reuse:
                 used_capture_ids.add(cap_id)
             if len(cap_list) >= max_keep:
@@ -692,11 +886,10 @@ class OcrAugmentAgent:
     """
 
     def __init__(self):
-        # 0 = no explicit cap (filter only by min chars + dedupe)
-        # default keep conservative to avoid oversized prompts
-        self.max_segments = int(os.getenv("OCR_AUGMENT_MAX_SEGMENTS", "40"))
+        # keep conservative defaults to avoid oversized prompts
+        self.max_segments = int(os.getenv("OCR_AUGMENT_MAX_SEGMENTS", "0"))
         self.min_text_chars = int(os.getenv("OCR_AUGMENT_MIN_TEXT_CHARS", "60"))
-        self.max_chars_per_segment = int(os.getenv("OCR_AUGMENT_MAX_TEXT_CHARS", "900"))
+        self.max_chars_per_segment = int(os.getenv("OCR_AUGMENT_MAX_TEXT_CHARS", "1200"))
         self.dedupe_similarity = float(os.getenv("OCR_AUGMENT_DEDUPE_SIMILARITY", "0.90"))
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -1416,7 +1609,12 @@ class GeneratorAgent:
             lines.append(f"[OCR {ts_hms}] score={score:.1f} kw={hit_text} | {txt}")
         return lines
 
-    def _build_outline_prompt(self, agenda: AgendaItem, agenda_data: Dict[str, Any], evidence_text: str) -> List[Dict[str, str]]:
+    def _build_outline_prompt(
+        self,
+        agenda: AgendaItem,
+        agenda_data: Dict[str, Any],
+        evidence_text: str,
+    ) -> List[Dict[str, str]]:
         topics, actions, decisions = self._filter_agenda_data_for_scope(agenda, agenda_data)
 
         compact = {
@@ -1458,7 +1656,11 @@ JSON เท่านั้น
 """
         return [{"role": "system", "content": self.outline_system}, {"role": "user", "content": user}]
 
-    def _build_write_prompt(self, outline: Dict[str, Any], evidence_text: str) -> List[Dict[str, str]]:
+    def _build_write_prompt(
+        self,
+        outline: Dict[str, Any],
+        evidence_text: str,
+    ) -> List[Dict[str, str]]:
         user = f"""เขียนรายงานเป็น HTML Fragment ตามรูปแบบรายงานประชุมทางการขององค์กร
 
 OUTLINE (JSON):
@@ -1484,7 +1686,12 @@ EVIDENCE:
 """
         return [{"role": "system", "content": self.write_system}, {"role": "user", "content": user}]
 
-    async def _outline(self, agenda: AgendaItem, agenda_data: Dict[str, Any], evidence_text: str) -> Dict[str, Any]:
+    async def _outline(
+        self,
+        agenda: AgendaItem,
+        agenda_data: Dict[str, Any],
+        evidence_text: str,
+    ) -> Dict[str, Any]:
         messages = self._build_outline_prompt(agenda, agenda_data, evidence_text)
         resp = await self.client.generate(messages, temperature=0.15, completion_tokens=1800)
         data = try_parse_json(resp)
@@ -1535,7 +1742,11 @@ EVIDENCE:
                 if ocr_lines:
                     evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
-                outline = await self._outline(ag, agenda_data, evidence_text)
+                outline = await self._outline(
+                    ag,
+                    agenda_data,
+                    evidence_text,
+                )
 
                 messages = self._build_write_prompt(outline, evidence_text)
                 logger.info(
@@ -2710,8 +2921,13 @@ def route_react_decision(state: "MeetingState") -> str:
 
 class AssembleAgent:
     def __init__(self):
+        self.image_scoring_mode = str(os.getenv("AGENDA_IMAGE_SCORING", "keyword")).strip().lower()
         self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "10.0"))
+        self.image_min_hit_tokens = int(os.getenv("AGENDA_IMAGE_MIN_HIT_TOKENS", "2"))
+        self.image_min_cosine_anchor = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_ANCHOR", "0.15"))
+        self.image_min_cosine_context = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_CONTEXT", "0.05"))
         self.image_max_per_agenda = int(os.getenv("AGENDA_IMAGE_MAX_PER_AGENDA", "3"))
+        self.image_max_per_anchor = int(os.getenv("AGENDA_IMAGE_MAX_PER_ANCHOR", "1"))
         self.image_allow_reuse = str(os.getenv("AGENDA_IMAGE_ALLOW_REUSE", "0")).strip().lower() in {
             "1",
             "true",
@@ -2725,12 +2941,22 @@ class AssembleAgent:
         agendas = parsed.agendas
         sections = state["agenda_sections"]
         ocr_captures = state.get("ocr_captures") or []
+        kg = KnowledgeGraph()
+        kg.nodes = (state.get("kg") or {}).get("nodes", {})
+        kg.edges = (state.get("kg") or {}).get("edges", [])
+        agenda_graph_data = [kg.query_agenda(ag.title) for ag in agendas]
         agenda_image_map = pick_related_ocr_capture_lists(
             agendas=agendas,
             sections=sections,
             ocr_captures=ocr_captures,
+            agenda_graph_data=agenda_graph_data,
             min_score=self.image_min_match_score,
+            min_hit_tokens=max(1, self.image_min_hit_tokens),
             max_per_agenda=max(1, self.image_max_per_agenda),
+            max_per_anchor=max(1, self.image_max_per_anchor),
+            scoring_mode=self.image_scoring_mode,
+            min_cosine_anchor=max(0.0, self.image_min_cosine_anchor),
+            min_cosine_context=max(0.0, self.image_min_cosine_context),
             allow_reuse=self.image_allow_reuse,
         )
         attendees_html = self._format_attendees(state["attendees_text"])
@@ -2793,19 +3019,20 @@ class AssembleAgent:
             return section_html
 
         blocks = [self._build_agenda_image_block(c, agenda_index) for c in captures]
-        blocks = [b for b in blocks if b]
+        blocks = [(i, b) for i, b in enumerate(blocks) if b]
         if not blocks:
             return section_html
 
         # Place images near actual section content: after each <h4> in order.
         h4_matches = list(re.finditer(r"<h4[^>]*>.*?</h4>", section_html, flags=re.IGNORECASE | re.DOTALL))
         if not h4_matches:
-            return "".join(blocks) + section_html
+            return "".join([b for _, b in blocks]) + section_html
 
         anchors = [m.end() for m in h4_matches]
         insert_map: Dict[int, List[str]] = {}
-        for i, block in enumerate(blocks):
-            pos = anchors[min(i, len(anchors) - 1)]
+        for i, block in blocks:
+            anchor_idx = safe_int(captures[i].get("anchor_index"), i)
+            pos = anchors[min(max(anchor_idx, 0), len(anchors) - 1)]
             insert_map.setdefault(pos, []).append(block)
 
         out_parts: List[str] = []
@@ -2844,7 +3071,10 @@ class AssembleAgent:
         ts_hms = str(capture.get("timestamp_hms", "") or "")
         score = float(capture.get("match_score", 0.0) or 0.0)
         keywords = ", ".join(capture.get("matched_keywords", [])[:4]) if capture.get("matched_keywords") else "-"
+        anchor_title = str(capture.get("anchor_title", "") or "").strip()
         caption = f"ภาพประกอบจาก OCR เวลา {ts_hms} | score={score:.1f} | keyword: {keywords}"
+        if anchor_title:
+            caption += f" | section: {anchor_title}"
         return (
             '<div class="agenda-image-wrap">'
             f'<img src="{img_src}" alt="agenda-{agenda_index+1}-ocr-image" loading="lazy"/>'
