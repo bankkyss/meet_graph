@@ -413,6 +413,25 @@ AGENDA_MATCH_STOPWORDS = {
     "ตุลาคม",
     "พฤศจิกายน",
     "ธันวาคม",
+    # Domain-specific stopwords (construction/meeting context)
+    "อาคาร",
+    "โครงการ",
+    "หน่วยงาน",
+    "มูลค่า",
+    "บาท",
+    "สรุป",
+    "ผลการ",
+    "ดำเนินการ",
+    "ความก้าวหน้า",
+    "สถานะ",
+    "ข้อมูล",
+    "แผน",
+    "สัญญา",
+    "ทั้งหมด",
+    "จำนวน",
+    "ราคา",
+    "กิจกรรม",
+    "ผู้รับผิดชอบ",
 }
 
 
@@ -558,10 +577,12 @@ def keyword_overlap_score(query_tokens: set, cap_tokens: set) -> Tuple[float, Li
 
 
 def capture_text_for_match(cap: Dict[str, Any]) -> str:
-    focus = str(cap.get("ocr_text_focus", "") or "").strip()
-    if focus:
-        return focus
-    return str(cap.get("ocr_text_clean", "") or "").strip()
+    # Prefer clean full text for better matching recall (headers, context)
+    # focus text is too aggressive and often strips important headers.
+    clean = str(cap.get("ocr_text_clean", "") or "").strip()
+    if clean:
+        return clean
+    return str(cap.get("ocr_text_focus", "") or "").strip()
 
 
 def clamp01(value: float) -> float:
@@ -580,12 +601,13 @@ def pick_related_ocr_capture_lists(
     min_hit_tokens: int = 2,
     max_per_agenda: int = 3,
     max_per_anchor: int = 1,
-    scoring_mode: str = "keyword",  # keyword | cosine | hybrid | imagemapper
+    scoring_mode: str = "hybrid",  # keyword | cosine | hybrid | imagemapper
     min_cosine_anchor: float = 0.15,
     min_cosine_context: float = 0.05,
     common_token_ratio: float = 0.35,
     common_token_min_docs: int = 4,
     allow_reuse: bool = False,
+    min_capture_content_chars: int = 80,
 ) -> Dict[int, List[Dict[str, Any]]]:
     selected: Dict[int, List[Dict[str, Any]]] = {}
     used_capture_ids = set()
@@ -663,6 +685,11 @@ def pick_related_ocr_capture_lists(
             if not cap_tokens:
                 continue
 
+            # Quality gate: skip captures with very short OCR text
+            cap_text_full = capture_text_for_match(cap)
+            if len(re.sub(r"\s+", "", cap_text_full)) < max(10, int(min_capture_content_chars)):
+                continue
+
             best_candidate: Optional[Dict[str, Any]] = None
             for anchor in anchors:
                 anchor_idx = safe_int(anchor.get("anchor_index"), 0)
@@ -735,14 +762,21 @@ def pick_related_ocr_capture_lists(
                         + (0.20 * time_score_norm)
                         + (0.30 * info_score_norm)
                     )
-                else:  # hybrid
+                else:  # hybrid (keyword + cosine + time proximity)
                     if len(hits_anchor) < max(1, int(min_hit_tokens)):
                         continue
                     if (cos_anchor < max(0.0, float(min_cosine_anchor))) and (
                         cos_ctx < max(0.0, float(min_cosine_context))
                     ):
                         continue
-                    score = (0.70 * ((1.0 * score_anchor) + (0.45 * score_ctx))) + (cos_anchor * 36.0) + (cos_ctx * 18.0)
+                    # Text relevance score
+                    text_relevance = (0.70 * ((1.0 * score_anchor) + (0.45 * score_ctx))) + (cos_anchor * 36.0) + (cos_ctx * 18.0)
+                    # Time proximity bonus: prefer captures temporally near the expected agenda position
+                    expected_ratio = float(i + 0.5) / float(agenda_count)
+                    actual_ratio = clamp01(safe_float(cap.get("timestamp_sec"), 0.0) / max_capture_ts)
+                    time_dist = abs(actual_ratio - expected_ratio)
+                    time_bonus = clamp01(1.0 - (time_dist / 0.5)) * 15.0  # up to 15 points bonus
+                    score = text_relevance + time_bonus
 
                 if score < min_score:
                     continue
@@ -3475,9 +3509,9 @@ def route_react_decision(state: "MeetingState") -> str:
 
 class AssembleAgent:
     def __init__(self):
-        self.image_scoring_mode = str(os.getenv("AGENDA_IMAGE_SCORING", "imagemapper")).strip().lower()
-        self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "18.0"))
-        self.image_min_hit_tokens = int(os.getenv("AGENDA_IMAGE_MIN_HIT_TOKENS", "2"))
+        self.image_scoring_mode = str(os.getenv("AGENDA_IMAGE_SCORING", "hybrid")).strip().lower()
+        self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "14.0"))
+        self.image_min_hit_tokens = int(os.getenv("AGENDA_IMAGE_MIN_HIT_TOKENS", "1"))
         self.image_min_cosine_anchor = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_ANCHOR", "0.18"))
         self.image_min_cosine_context = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_CONTEXT", "0.08"))
         self.image_common_token_ratio = float(os.getenv("AGENDA_IMAGE_COMMON_TOKEN_RATIO", "0.35"))
@@ -3604,6 +3638,7 @@ class AssembleAgent:
         state["kg_image_links_count"] = kg_image_links_count
         state["final_html"] = final_html
         state["agenda_image_count"] = sum(len(x) for x in agenda_image_map.values())
+        state["agenda_image_map"] = {int(k): v for k, v in agenda_image_map.items()}
         return state
 
     def _apply_global_image_cap(self, agenda_image_map: Dict[int, List[Dict[str, Any]]]) -> Dict[int, List[Dict[str, Any]]]:

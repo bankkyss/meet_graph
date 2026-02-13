@@ -668,6 +668,24 @@ def main() -> None:
     parser.add_argument("--editor-completion-tokens", type=int, default=2400)
     parser.add_argument("--with-images", action="store_true", help="Attach video frames into HTML")
     parser.add_argument("--ocr-json", default="", help="Path to capture_ocr_results.json (optional)")
+    parser.add_argument(
+        "--min-ocr-text-len",
+        type=int,
+        default=80,
+        help="Minimum OCR text length (chars) to keep a capture before passing to workflow.",
+    )
+    parser.add_argument(
+        "--filter-gallery-captures",
+        action="store_true",
+        default=True,
+        help="Filter out gallery-view captures (participant name grids) before workflow.",
+    )
+    parser.add_argument("--no-filter-gallery-captures", dest="filter_gallery_captures", action="store_false")
+    parser.add_argument(
+        "--dump-image-matching-log",
+        action="store_true",
+        help="Save a JSON file with detailed image-to-agenda matching scores.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -703,6 +721,45 @@ def main() -> None:
                 )
     if not str(config.get("MEETING_INFO", "")).strip() or not str(config.get("AGENDA_TEXT", "")).strip():
         raise ValueError("Config must contain MEETING_INFO and AGENDA_TEXT")
+
+    # ---- Pre-workflow OCR quality filter ----
+    pre_filter_count = 0
+    if ocr_raw is not None and isinstance(ocr_raw.get("captures"), list):
+        import re as _re
+        min_len = max(10, int(args.min_ocr_text_len))
+        original_count = len(ocr_raw["captures"])
+        filtered_captures = []
+        for cap in ocr_raw["captures"]:
+            if not isinstance(cap, dict):
+                continue
+            # Skip captures already marked as skipped
+            if str(cap.get("ocr_skipped_reason", "") or "").strip():
+                filtered_captures.append(cap)
+                continue
+            ocr_text = str(cap.get("ocr_text", "") or "").strip()
+            # Filter by minimum text length
+            content_chars = _re.sub(r"[\s|\-_=+]+", "", ocr_text)
+            if len(content_chars) < min_len:
+                cap["ocr_skipped_reason"] = "too_short"
+                pre_filter_count += 1
+            # Filter gallery-view captures
+            elif args.filter_gallery_captures:
+                lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
+                if lines and len(lines) <= 8:
+                    import re as _re2
+                    gallery_pat = _re2.compile(
+                        r"(?i)(\u0e04\u0e38\u0e13|\u0e19\u0e32\u0e22|\u0e19\u0e32\u0e07|\u0e19\u0e32\u0e07\u0e2a\u0e32\u0e27|Mr\.|Ms\.|Mrs\.|Dr\.)"
+                    )
+                    avg_len = sum(len(ln) for ln in lines) / max(1, len(lines))
+                    if avg_len <= 40:
+                        name_hits = sum(1 for ln in lines if gallery_pat.search(ln))
+                        if (name_hits / max(1, len(lines))) >= 0.5:
+                            cap["ocr_skipped_reason"] = "gallery_view"
+                            pre_filter_count += 1
+            filtered_captures.append(cap)
+        ocr_raw["captures"] = filtered_captures
+        if pre_filter_count > 0:
+            print(f"[pre-filter] tagged {pre_filter_count}/{original_count} OCR captures as low-quality")
 
     print("Running WORKFLOW_REACT...")
     try:
@@ -788,12 +845,50 @@ def main() -> None:
     print(f"Officially rewritten sections (extra local pass): {extra_rewritten_count}")
     print(f"Extracted frames: {len(frame_files)}")
     print(f"Injected images in HTML: {injected_count}")
+    # ---- Validation Summary: Image-Agenda Matching ----
+    agenda_image_map = out_state.get("agenda_image_map")
+    if isinstance(agenda_image_map, dict) and agenda_image_map:
+        print("\n" + "=" * 60)
+        print("IMAGE-AGENDA MATCHING SUMMARY")
+        print("=" * 60)
+        for agenda_idx, images in sorted(agenda_image_map.items()):
+            if agenda_idx < len(parsed.agendas):
+                title = parsed.agendas[agenda_idx].title[:60]
+            else:
+                title = f"agenda_{agenda_idx}"
+            img_count = len(images) if isinstance(images, list) else 0
+            print(f"  [{agenda_idx}] {title}")
+            if isinstance(images, list):
+                for img in images:
+                    if isinstance(img, dict):
+                        score = img.get("match_score", 0)
+                        cap_idx = img.get("capture_index", "?")
+                        keywords = img.get("matched_keywords", [])[:5]
+                        mode = img.get("match_mode", "?")
+                        print(f"      capture={cap_idx} score={score:.1f} mode={mode} keywords={keywords}")
+            if img_count == 0:
+                print("      (no images matched)")
+        print("=" * 60 + "\n")
+
+    # ---- Dump Image Matching Log ----
+    if args.dump_image_matching_log and isinstance(agenda_image_map, dict):
+        log_path = run_dir / "image_matching_log.json"
+        log_data = {}
+        for agenda_idx, images in agenda_image_map.items():
+            log_data[str(agenda_idx)] = {
+                "agenda_title": parsed.agendas[agenda_idx].title if agenda_idx < len(parsed.agendas) else f"agenda_{agenda_idx}",
+                "matched_images": images if isinstance(images, list) else [],
+            }
+        log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Image matching log: {log_path}")
+
     print(f"OCR augmented segments: {int(out_state.get('ocr_augmented_count', 0) or 0)}")
     print(f"OCR truncated captures: {int(out_state.get('ocr_truncated_capture_count', 0) or 0)}")
     print(f"OCR truncated chars total: {int(out_state.get('ocr_truncated_chars_total', 0) or 0)}")
     print(f"OCR-linked agenda images: {int(out_state.get('agenda_image_count', 0) or 0)}")
     print(f"KG image links added: {int(out_state.get('kg_image_links_count', 0) or 0)}")
-
+    if pre_filter_count > 0:
+        print(f"Pre-filtered OCR captures: {pre_filter_count}")
 
 if __name__ == "__main__":
     main()

@@ -14,21 +14,34 @@ spec:
       labels:
         app: typhoon-vllm
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: ailprsvai02 # ระบุ node ที่มี L40S GPU
       containers:
       - name: vllm-server
-        # nodeSelector:
-        #   name: l40s-node # ระบุ node ที่มี L40S GPU
         image: vllm/vllm-openai:latest # หรือระบุเวอร์ชัน เช่น v0.7.0
-        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]  
         args:
           - "--model"
-          - "scb10x/typhoon-v2.5-30b-a3b-instruct"
+          - "typhoon-ai/typhoon2.5-qwen3-30b-a3b"
+          - "--quantization"
+          - "bitsandbytes"
+          - "--load-format"
+          - "bitsandbytes"
+          - "--dtype"
+          - "bfloat16"
+          - "--kv-cache-dtype"
+          - "auto"
           - "--gpu-memory-utilization"
-          - "0.90" # จอง VRAM 90% ของ L40S
+          - "0.80"
           - "--max-model-len"
-          - "32768" # ปรับตามความเหมาะสมของ Context
-          - "--trust-remote-code"
+          - "8192"
+          - "--max-num-seqs"
+          - "4"
+          - "--max-num-batched-tokens"
+          - "1024"
         env:
+          - name: PYTORCH_CUDA_ALLOC_CONF
+            value: "expandable_segments:True"
           - name: HUGGING_FACE_HUB_TOKEN
             valueFrom:
               secretKeyRef:
@@ -65,5 +78,5 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 100Gi 
-  storageClassName: standard-rwo 
+      storage: 150Gi 
+  storageClassName: ceph-rbd
