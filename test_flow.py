@@ -689,6 +689,18 @@ def main() -> None:
         captures = ocr_raw.get("captures")
         if captures is not None and not isinstance(captures, list):
             raise ValueError("OCR JSON field `captures` must be a list")
+        if captures is None:
+            if isinstance(ocr_raw.get("segments"), list):
+                print(
+                    "[warn] --ocr-json looks like transcript JSON (has `segments`, no `captures`). "
+                    "Image embedding from OCR will be disabled. Use capture_ocr_results.json.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[warn] --ocr-json has no `captures`; OCR image matching may return zero images.",
+                    flush=True,
+                )
     if not str(config.get("MEETING_INFO", "")).strip() or not str(config.get("AGENDA_TEXT", "")).strip():
         raise ValueError("Config must contain MEETING_INFO and AGENDA_TEXT")
 
@@ -756,8 +768,20 @@ def main() -> None:
     if use_post_video_images:
         final_html, injected_count = inject_images_into_html(final_html, parsed, frame_points, frame_files, html_path)
     html_path.write_text(final_html, encoding="utf-8")
+    kg_path = run_dir / "kg_state.json"
+    kg_payload = out_state.get("kg")
+    if isinstance(kg_payload, dict):
+        kg_path.write_text(json.dumps(kg_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    ocr_caps_path = run_dir / "ocr_captures_augmented.json"
+    ocr_caps_payload = out_state.get("ocr_captures")
+    if isinstance(ocr_caps_payload, list):
+        ocr_caps_path.write_text(json.dumps(ocr_caps_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Created HTML: {html_path}")
+    if isinstance(kg_payload, dict):
+        print(f"KG JSON: {kg_path}")
+    if isinstance(ocr_caps_payload, list):
+        print(f"OCR captures (augmented): {ocr_caps_path}")
     print(f"Frames folder: {frames_dir}")
     print(f"Agenda count: {len(parsed.agendas)}")
     print(f"Officially rewritten sections (workflow): {workflow_official_rewritten_count}")
@@ -765,7 +789,10 @@ def main() -> None:
     print(f"Extracted frames: {len(frame_files)}")
     print(f"Injected images in HTML: {injected_count}")
     print(f"OCR augmented segments: {int(out_state.get('ocr_augmented_count', 0) or 0)}")
+    print(f"OCR truncated captures: {int(out_state.get('ocr_truncated_capture_count', 0) or 0)}")
+    print(f"OCR truncated chars total: {int(out_state.get('ocr_truncated_chars_total', 0) or 0)}")
     print(f"OCR-linked agenda images: {int(out_state.get('agenda_image_count', 0) or 0)}")
+    print(f"KG image links added: {int(out_state.get('kg_image_links_count', 0) or 0)}")
 
 
 if __name__ == "__main__":

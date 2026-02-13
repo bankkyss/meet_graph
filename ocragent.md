@@ -11,6 +11,7 @@
 - เอาต์พุตสำคัญ:
   - `capture_ocr_results.json` จากสคริปต์ OCR
   - รายงาน HTML ที่ฝังรูปไว้ตามเนื้อหาแต่ละวาระ
+  - `ocr_captures_augmented.json` (หลังผ่าน clean/focus/dedupe ใน workflow)
 
 ## 2) ขั้นสร้าง OCR จากวิดีโอ (`video_change_ocr.py`)
 
@@ -49,19 +50,27 @@ Node: `OcrAugmentAgent` ใน `services/meeting_workflow.py`
    - ตัดรายการที่ถูก mark `ocr_skipped_reason`
    - ตัดข้อความสั้นกว่า `OCR_AUGMENT_MIN_TEXT_CHARS` (default 40)
    - ตัดข้อความซ้ำด้วย similarity (`OCR_AUGMENT_DEDUPE_SIMILARITY`)
+   - เก็บสถิติการตัดตัวอักษร:
+     - `ocr_text_source_chars`
+     - `ocr_text_kept_chars`
+     - `ocr_text_truncated_chars`
+     - `ocr_text_was_truncated`
 3. จำกัดจำนวน OCR ที่จะ merge เข้าระบบด้วย `OCR_AUGMENT_MAX_SEGMENTS`
 4. แปลง OCR เป็น transcript segment (speaker = `SCREEN_OCR`) แล้ว merge กับ transcript เดิม
 5. เก็บ `ocr_captures` ไว้ใช้ตอน match รูปในขั้น assemble
+   - มีทั้ง `ocr_text_clean` และ `ocr_text_focus`
 
 ผลคือ OCR ถูกใช้ทั้งใน "เนื้อหาที่ model เขียน" และ "การเลือกภาพประกอบ"
 
 ## 5) OCR ช่วยสร้างเนื้อหารายงานยังไง
 
-Node สร้างเนื้อหา (Generator) จะดึง OCR ที่เกี่ยวกับวาระมาเป็น `OCR EVIDENCE`
+Node สร้าง/รีไรต์เนื้อหา (Generator, Validation, Compliance, ReAct, Official Editor)
+จะดึง OCR ที่เกี่ยวกับวาระมาเป็น `OCR EVIDENCE`
 
 1. เอา keyword วาระไปเทียบ `ocr_text_clean`
 2. คัดบรรทัด OCR ที่ score พอ
 3. ต่อท้าย evidence ก่อนให้ LLM เขียน section
+4. ใช้ `ocr_text_focus` เป็นหลัก เพื่อให้คำเฉพาะ (เช่นชื่อโครงการ/หน่วยงาน) หลุดน้อยลง
 
 ดังนั้น OCR ไม่ได้มีไว้แค่ใส่รูป แต่ช่วยให้ข้อความรายงานอิงข้อมูลบนสไลด์/หน้าจอด้วย
 
@@ -80,17 +89,23 @@ Node: `AssembleAgent` เรียก `pick_related_ocr_capture_lists(...)`
    - `keyword`: นับ hit token + coverage + jaccard
    - `cosine`: cosine similarity บน token bag
    - `hybrid`: ผสม keyword + cosine
+   - `imagemapper`: คะแนนรวม
+     - `50%` text relevance
+     - `20%` time alignment
+     - `30%` data richness
 4. ผ่าน threshold แล้วคัด top-N
    - จำกัดต่อวาระ (`AGENDA_IMAGE_MAX_PER_AGENDA`)
    - จำกัดต่อ anchor (`AGENDA_IMAGE_MAX_PER_ANCHOR`)
    - คุม reuse ข้ามวาระ (`AGENDA_IMAGE_ALLOW_REUSE`)
+5. ใช้ `ocr_text_focus` เป็นหลักตอน match
+   - ถ้าไม่มีค่อย fallback ไป `ocr_text_clean`
 
 ## 7) ขั้นแทรกรูปลง HTML
 
 หลังเลือกภาพได้แล้ว ระบบจะ inject รูปเข้า section
 
 1. ถ้ามี `<h4>`:
-   - แทรกรูป "หลังหัวข้อ `<h4>` ที่ match" ตาม `anchor_index`
+   - แทรกรูปตาม sentence/span ที่สัมพันธ์ที่สุดใน block ของ `<h4>` ที่ match
 2. ถ้าไม่มี `<h4>`:
    - fallback ไปแทรกก่อนเนื้อหา section
 3. Caption รูปจะแสดง:
@@ -98,6 +113,30 @@ Node: `AssembleAgent` เรียก `pick_related_ocr_capture_lists(...)`
    - score
    - matched keywords
    - ชื่อ section ที่ match (ถ้ามี)
+
+## 7.1) KG ความสัมพันธ์รูปกับเนื้อหา (ล่าสุด)
+
+ตอน `assemble` ระบบจะเขียนความสัมพันธ์รูปกลับเข้า KG ด้วย:
+
+- Nodes ใหม่:
+  - `section` (ต่อวาระ/หัวข้อย่อย `<h4>`)
+  - `image` (ต่อ OCR capture ที่ถูกเลือก)
+- Edges ใหม่:
+  - `agenda_has_section`
+  - `agenda_has_image`
+  - `section_has_image`
+  - `image_supports_topic`
+  - `image_supports_action`
+  - `image_supports_decision`
+
+เพื่อให้รูปผูกกับ "วาระ + section + entity เชิงเนื้อหา" ไม่ใช่แค่แปะใน HTML อย่างเดียว
+
+นอกจากนี้ edge รูปใน KG มี metadata น้ำหนักเพิ่ม:
+
+- `weight`
+- `semantic_overlap` (สำหรับ edge เชิง entity)
+- `decay_weight` (time decay)
+- `timestamp_sec`
 
 ## 8) ทำไมบางครั้งรูปดูไม่เกี่ยว
 
@@ -116,15 +155,27 @@ OCR_AUGMENT_MAX_SEGMENTS=60
 OCR_AUGMENT_MAX_TEXT_CHARS=1200
 OCR_AUGMENT_MIN_TEXT_CHARS=40
 
-AGENDA_IMAGE_SCORING=hybrid
+AGENDA_IMAGE_SCORING=imagemapper
 AGENDA_IMAGE_MIN_MATCH_SCORE=18
 AGENDA_IMAGE_MIN_HIT_TOKENS=2
 AGENDA_IMAGE_MIN_COSINE_ANCHOR=0.18
 AGENDA_IMAGE_MIN_COSINE_CONTEXT=0.08
+AGENDA_IMAGE_COMMON_TOKEN_RATIO=0.35
+AGENDA_IMAGE_COMMON_TOKEN_MIN_DOCS=4
 
-AGENDA_IMAGE_MAX_PER_AGENDA=3
+AGENDA_IMAGE_MAX_PER_AGENDA=2
 AGENDA_IMAGE_MAX_PER_ANCHOR=1
+AGENDA_IMAGE_MAX_TOTAL=4
+AGENDA_IMAGE_ENTITY_MIN_OVERLAP=0.08
+AGENDA_IMAGE_EDGE_DECAY_TAU_SEC=1800
 AGENDA_IMAGE_ALLOW_REUSE=0
+
+# กันกรณีคัดรูปเข้มเกินจนเหลือรูปน้อย
+AGENDA_IMAGE_FALLBACK_ENABLED=1
+AGENDA_IMAGE_MIN_TOTAL_TARGET=3
+AGENDA_IMAGE_FALLBACK_SCORING=imagemapper
+AGENDA_IMAGE_FALLBACK_MIN_MATCH_SCORE=8
+AGENDA_IMAGE_FALLBACK_MIN_HIT_TOKENS=1
 ```
 
 ## 10) สรุปสั้นที่สุด
@@ -134,5 +185,5 @@ AGENDA_IMAGE_ALLOW_REUSE=0
   - ใช้เลือกภาพประกอบแล้ววางตาม anchor ใน section
 - จุดชี้ชะตาความแม่นคือ:
   - คุณภาพ OCR text
-  - scoring mode (`hybrid` มักบาลานซ์สุด)
+  - scoring mode (`imagemapper` แม่นยำขึ้นเมื่อ OCR มี timestamp และ metadata ดี)
   - thresholds และ limits ตอนคัดภาพ

@@ -9,6 +9,7 @@ import re
 from collections import Counter
 from difflib import SequenceMatcher
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
@@ -70,6 +71,63 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[“”\"'`]", "", s)
     return s
+
+
+@lru_cache(maxsize=1)
+def load_kg_entity_aliases() -> Dict[str, Dict[str, str]]:
+    raw = str(os.getenv("KG_ENTITY_ALIASES_JSON", "") or "").strip()
+    if not raw:
+        return {}
+
+    data: Dict[str, Any] = {}
+    try:
+        if raw.startswith("{"):
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                data = obj
+        else:
+            path = Path(raw)
+            if path.exists():
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(obj, dict):
+                    data = obj
+    except Exception as exc:
+        logger.warning("KG alias map parse failed: %s", exc)
+        return {}
+
+    out: Dict[str, Dict[str, str]] = {}
+    for etype, mapping in data.items():
+        et = str(etype or "").strip().lower()
+        if not et or not isinstance(mapping, dict):
+            continue
+        canon_map: Dict[str, str] = {}
+        for k, v in mapping.items():
+            src = normalize_text(str(k or ""))
+            dst = normalize_text(str(v or ""))
+            if src and dst:
+                canon_map[src] = dst
+        if canon_map:
+            out[et] = canon_map
+    return out
+
+
+def canonicalize_entity_text(entity_type: str, text: str) -> str:
+    etype = str(entity_type or "").strip().lower()
+    value = normalize_text(text)
+    value = re.sub(r"[^0-9a-zก-๙_\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return ""
+
+    if etype == "speaker":
+        value = re.sub(r"^(นาย|นางสาว|นาง|คุณ|mr|mrs|ms|dr)\s+", "", value, flags=re.IGNORECASE).strip()
+    elif etype == "agenda":
+        value = re.sub(r"\s+", " ", value).strip()
+    elif etype == "topic":
+        value = re.sub(r"\s+", " ", value).strip()
+
+    alias_map = load_kg_entity_aliases().get(etype) or {}
+    return alias_map.get(value, value)
 
 
 def strip_code_fences(text: str) -> str:
@@ -151,15 +209,76 @@ def clean_ocr_text_for_workflow(text: str, max_chars: int = 900) -> str:
         return ""
     value = re.sub(r"<page_number>\s*\d+\s*</page_number>", " ", value, flags=re.IGNORECASE)
     value = re.sub(r"PageNumber\s*=\s*\"[^\"]+\"", " ", value, flags=re.IGNORECASE)
-    value = value.replace("<br/>", "\n").replace("<br>", "\n")
-    value = re.sub(r"</?(table|tr|td|th|thead|tbody|ul|ol|li|strong|b|i|u|p|div|span)[^>]*>", " ", value, flags=re.IGNORECASE)
+    # Keep table/list boundaries so entity lines (e.g., project names) are not lost in one giant row.
+    value = re.sub(r"<\s*br\s*/?\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*/\s*tr\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*tr[^>]*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*/\s*li\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*li[^>]*>", " - ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*/\s*(p|div|section|h[1-6])\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*/\s*(td|th)\s*>", " | ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<\s*(td|th)[^>]*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"</?(table|thead|tbody|ul|ol|strong|b|i|u|p|div|span)[^>]*>",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
     value = re.sub(r"<[^>]+>", " ", value)
     value = html_lib.unescape(value)
+    value = re.sub(r"\s*\|\s*\|\s*", " | ", value)
     value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n\s+\n", "\n\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value).strip()
-    if len(value) > max_chars:
+    if max_chars > 0 and len(value) > max_chars:
         value = value[:max_chars].rsplit(" ", 1)[0].strip()
     return value
+
+
+def extract_ocr_focus_text_for_workflow(
+    text: str,
+    max_chars: int = 420,
+    max_lines: int = 5,
+) -> str:
+    source = (text or "").strip()
+    if not source:
+        return ""
+
+    raw_lines = [ln.strip() for ln in re.split(r"[\r\n]+", source) if ln and ln.strip()]
+    if not raw_lines:
+        raw_lines = [source]
+
+    key_pattern = re.compile(
+        r"(วันที่|กำหนด|deadline|due|owner|ผู้รับผิดชอบ|สถานะ|status|project|โครงการ|action|มติ|decision|kpi|เป้า|งบ|budget|บาท|หน่วยงาน|department)",
+        flags=re.IGNORECASE,
+    )
+
+    scored: List[Tuple[float, int, str]] = []
+    for i, ln in enumerate(raw_lines):
+        norm = normalize_text(ln)
+        tokens = re.findall(r"[A-Za-z0-9ก-๙_]+", norm)
+        num_count = len(re.findall(r"\d+", ln))
+        long_token_count = len([t for t in tokens if len(t) >= 3])
+        key_hit = 1.0 if key_pattern.search(norm) else 0.0
+        score = (key_hit * 4.0) + (num_count * 1.2) + min(5.0, float(long_token_count) * 0.25)
+        scored.append((score, i, ln))
+
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    picked: List[Tuple[int, str]] = []
+    seen_norm = set()
+    for _, idx, ln in scored:
+        n = normalize_text(ln)
+        if not n or n in seen_norm:
+            continue
+        picked.append((idx, ln))
+        seen_norm.add(n)
+        if len(picked) >= max(1, int(max_lines)):
+            break
+
+    picked.sort(key=lambda x: x[0])
+    out = "\n".join([ln for _, ln in picked]).strip()
+    out = clean_ocr_text_for_workflow(out, max_chars=max(120, int(max_chars)))
+    return out
 
 
 def similarity_ratio(a: str, b: str) -> float:
@@ -189,19 +308,27 @@ def parse_ocr_results_for_workflow(
         if str(item.get("ocr_skipped_reason", "") or "").strip():
             continue
 
+        raw_text = str(item.get("ocr_text", "") or "")
+        full_clean_text = clean_ocr_text_for_workflow(
+            raw_text,
+            max_chars=0,
+        )
         text = clean_ocr_text_for_workflow(
-            str(item.get("ocr_text", "") or ""),
+            full_clean_text,
             max_chars=max(80, int(max_chars_per_segment)),
         )
         if len(text) < max(1, int(min_text_chars)):
             continue
         if any(similarity_ratio(prev, text) >= dedupe_similarity for prev in accepted_texts):
             continue
+        focus_text = extract_ocr_focus_text_for_workflow(full_clean_text, max_chars=420, max_lines=5)
+        truncated_chars = max(0, len(full_clean_text) - len(text))
 
         ts_sec = safe_float(item.get("timestamp_sec"), 0.0)
         ts_hms = str(item.get("timestamp_hms", "") or "")
         capture_idx = safe_int(item.get("capture_index"), 0)
-        segment_text = f"[OCR {ts_hms}] {text}" if ts_hms else f"[OCR] {text}"
+        segment_payload = (focus_text or text).strip() or text
+        segment_text = f"[OCR {ts_hms}] {segment_payload}" if ts_hms else f"[OCR] {segment_payload}"
 
         ocr_segments.append(
             TranscriptSegment(
@@ -218,6 +345,11 @@ def parse_ocr_results_for_workflow(
                 "timestamp_hms": ts_hms,
                 "image_path": str(item.get("image_path", "") or ""),
                 "ocr_text_clean": text,
+                "ocr_text_focus": focus_text or text,
+                "ocr_text_source_chars": len(full_clean_text),
+                "ocr_text_kept_chars": len(text),
+                "ocr_text_truncated_chars": truncated_chars,
+                "ocr_text_was_truncated": bool(truncated_chars > 0),
             }
         )
         accepted_texts.append(text)
@@ -248,6 +380,39 @@ AGENDA_MATCH_STOPWORDS = {
     "for",
     "with",
     "from",
+    "หมายเหตุ",
+    "note",
+    "notes",
+    "project",
+    "manager",
+    "excel",
+    "view",
+    "protected",
+    "protection",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+    "มกราคม",
+    "กุมภาพันธ์",
+    "มีนาคม",
+    "เมษายน",
+    "พฤษภาคม",
+    "มิถุนายน",
+    "กรกฎาคม",
+    "สิงหาคม",
+    "กันยายน",
+    "ตุลาคม",
+    "พฤศจิกายน",
+    "ธันวาคม",
 }
 
 
@@ -257,6 +422,8 @@ def agenda_match_tokens(text: str) -> List[str]:
     seen = set()
     for tok in toks:
         if len(tok) < 2:
+            continue
+        if tok.isdigit():
             continue
         if tok in AGENDA_MATCH_STOPWORDS:
             continue
@@ -272,6 +439,8 @@ def agenda_match_token_bag(text: str) -> List[str]:
     out: List[str] = []
     for tok in toks:
         if len(tok) < 2:
+            continue
+        if tok.isdigit():
             continue
         if tok in AGENDA_MATCH_STOPWORDS:
             continue
@@ -388,6 +557,20 @@ def keyword_overlap_score(query_tokens: set, cap_tokens: set) -> Tuple[float, Li
     return score, hits, coverage, jaccard
 
 
+def capture_text_for_match(cap: Dict[str, Any]) -> str:
+    focus = str(cap.get("ocr_text_focus", "") or "").strip()
+    if focus:
+        return focus
+    return str(cap.get("ocr_text_clean", "") or "").strip()
+
+
+def clamp01(value: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
+
+
 def pick_related_ocr_capture_lists(
     agendas: List[AgendaItem],
     sections: List[str],
@@ -397,16 +580,44 @@ def pick_related_ocr_capture_lists(
     min_hit_tokens: int = 2,
     max_per_agenda: int = 3,
     max_per_anchor: int = 1,
-    scoring_mode: str = "keyword",  # keyword | cosine | hybrid
+    scoring_mode: str = "keyword",  # keyword | cosine | hybrid | imagemapper
     min_cosine_anchor: float = 0.15,
     min_cosine_context: float = 0.05,
+    common_token_ratio: float = 0.35,
+    common_token_min_docs: int = 4,
     allow_reuse: bool = False,
 ) -> Dict[int, List[Dict[str, Any]]]:
     selected: Dict[int, List[Dict[str, Any]]] = {}
     used_capture_ids = set()
     mode = str(scoring_mode or "keyword").strip().lower()
-    if mode not in {"keyword", "cosine", "hybrid"}:
+    if mode not in {"keyword", "cosine", "hybrid", "imagemapper"}:
         mode = "keyword"
+
+    agenda_count = max(1, int(len(agendas)))
+    max_capture_ts = 0.0
+    for cap in ocr_captures:
+        max_capture_ts = max(max_capture_ts, safe_float(cap.get("timestamp_sec"), 0.0))
+    if max_capture_ts <= 0.0:
+        max_capture_ts = 1.0
+
+    capture_token_bag: Dict[int, List[str]] = {}
+    token_doc_freq: Counter = Counter()
+    for cap in ocr_captures:
+        cap_id = safe_int(cap.get("capture_index"), 0)
+        cap_text = capture_text_for_match(cap)
+        bag = agenda_match_token_bag(cap_text)
+        capture_token_bag[cap_id] = bag
+        if bag:
+            token_doc_freq.update(set(bag))
+
+    common_tokens: set = set()
+    total_docs = max(1, int(len(capture_token_bag)))
+    ratio_threshold = max(0.0, min(1.0, float(common_token_ratio)))
+    min_docs_threshold = max(2, int(common_token_min_docs))
+    if total_docs >= 3:
+        for tok, df in token_doc_freq.items():
+            if df >= min_docs_threshold and (float(df) / float(total_docs)) >= ratio_threshold:
+                common_tokens.add(tok)
 
     for i, agenda in enumerate(agendas):
         agenda_data = (agenda_graph_data[i] if agenda_graph_data and i < len(agenda_graph_data) else {}) or {}
@@ -414,7 +625,8 @@ def pick_related_ocr_capture_lists(
         base_query = " ".join([agenda.title] + (agenda.details or []))
         graph_ctx = agenda_graph_context_by_kind(agenda_data)
         query_source = " ".join([base_query, section_text[:1400], graph_ctx.get("summary", "")])
-        query_bag = agenda_match_token_bag(query_source)
+        query_bag_raw = agenda_match_token_bag(query_source)
+        query_bag = [t for t in query_bag_raw if t not in common_tokens] or query_bag_raw
         query_tokens = set(query_bag)
         if not query_tokens:
             continue
@@ -435,7 +647,8 @@ def pick_related_ocr_capture_lists(
                     graph_ctx.get(anchor_kind, ""),
                 ]
             )
-            anchor_bag = agenda_match_token_bag(anchor_query)
+            anchor_bag_raw = agenda_match_token_bag(anchor_query)
+            anchor_bag = [t for t in anchor_bag_raw if t not in common_tokens] or anchor_bag_raw
             anchor_token_map[anchor_idx] = set(anchor_bag)
             anchor_bag_map[anchor_idx] = anchor_bag
 
@@ -444,8 +657,8 @@ def pick_related_ocr_capture_lists(
             cap_id = safe_int(cap.get("capture_index"), 0)
             if (not allow_reuse) and cap_id in used_capture_ids:
                 continue
-            cap_text = str(cap.get("ocr_text_clean", "") or "")
-            cap_bag = agenda_match_token_bag(cap_text)
+            cap_bag_raw = capture_token_bag.get(cap_id) or []
+            cap_bag = [t for t in cap_bag_raw if t not in common_tokens] or cap_bag_raw
             cap_tokens = set(cap_bag)
             if not cap_tokens:
                 continue
@@ -462,6 +675,9 @@ def pick_related_ocr_capture_lists(
                 cos_anchor = cosine_sim_token_bags(anchor_bag_map.get(anchor_idx) or [], cap_bag)
                 cos_ctx = cosine_sim_token_bags(query_bag, cap_bag)
                 all_hits = list(dict.fromkeys(hits_anchor + hits_ctx))
+                text_score_norm = 0.0
+                time_score_norm = 0.0
+                info_score_norm = 0.0
 
                 if mode == "keyword":
                     if len(hits_anchor) < max(1, int(min_hit_tokens)):
@@ -473,10 +689,60 @@ def pick_related_ocr_capture_lists(
                     if cos_ctx < max(0.0, float(min_cosine_context)):
                         continue
                     score = (cos_anchor * 100.0) + (cos_ctx * 40.0)
-                else:  # hybrid
-                    if (len(hits_anchor) < max(1, int(min_hit_tokens))) and (cos_anchor < max(0.0, float(min_cosine_anchor))):
+                elif mode == "imagemapper":
+                    if len(hits_anchor) < max(1, int(min_hit_tokens)):
                         continue
-                    score = (0.65 * ((1.0 * score_anchor) + (0.45 * score_ctx))) + (cos_anchor * 30.0) + (cos_ctx * 12.0)
+
+                    # 50% text relevance: semantic overlap between anchor/context and OCR text.
+                    hit_norm = clamp01(float(len(hits_anchor)) / max(1.0, float(max(1, min_hit_tokens))))
+                    text_score_norm = clamp01(
+                        (0.28 * hit_norm)
+                        + (0.20 * cov_anchor)
+                        + (0.10 * jac_anchor)
+                        + (0.18 * cov_ctx)
+                        + (0.08 * jac_ctx)
+                        + (0.11 * cos_anchor)
+                        + (0.05 * cos_ctx)
+                    )
+
+                    # 20% time alignment: prefer captures in the expected agenda time window.
+                    expected_ratio = float(i + 0.5) / float(agenda_count)
+                    actual_ratio = clamp01(safe_float(cap.get("timestamp_sec"), 0.0) / max_capture_ts)
+                    time_dist = abs(actual_ratio - expected_ratio)
+                    time_score_norm = clamp01(1.0 - (time_dist / 0.5))
+
+                    # 30% data richness: prefer captures with denser and less-truncated information.
+                    cap_text = capture_text_for_match(cap)
+                    text_len = len(cap_text.strip())
+                    length_norm = clamp01(float(text_len) / 260.0)
+                    num_count = len(re.findall(r"\d+", cap_text))
+                    numeric_norm = clamp01(float(num_count) / 8.0)
+                    unique_norm = clamp01(float(len(cap_tokens)) / 26.0)
+                    source_chars = safe_int(cap.get("ocr_text_source_chars"), max(1, text_len))
+                    if source_chars <= 0:
+                        source_chars = max(1, text_len)
+                    truncated_chars = max(0, safe_int(cap.get("ocr_text_truncated_chars"), 0))
+                    retained_ratio = clamp01(float(max(0, source_chars - truncated_chars)) / float(source_chars))
+                    info_score_norm = clamp01(
+                        (0.35 * length_norm)
+                        + (0.20 * numeric_norm)
+                        + (0.25 * unique_norm)
+                        + (0.20 * retained_ratio)
+                    )
+
+                    score = 100.0 * (
+                        (0.50 * text_score_norm)
+                        + (0.20 * time_score_norm)
+                        + (0.30 * info_score_norm)
+                    )
+                else:  # hybrid
+                    if len(hits_anchor) < max(1, int(min_hit_tokens)):
+                        continue
+                    if (cos_anchor < max(0.0, float(min_cosine_anchor))) and (
+                        cos_ctx < max(0.0, float(min_cosine_context))
+                    ):
+                        continue
+                    score = (0.70 * ((1.0 * score_anchor) + (0.45 * score_ctx))) + (cos_anchor * 36.0) + (cos_ctx * 18.0)
 
                 if score < min_score:
                     continue
@@ -492,8 +758,13 @@ def pick_related_ocr_capture_lists(
                 cand["match_context_jaccard"] = jac_ctx
                 cand["match_anchor_cosine"] = cos_anchor
                 cand["match_context_cosine"] = cos_ctx
+                if mode == "imagemapper":
+                    cand["match_text_score"] = text_score_norm
+                    cand["match_time_score"] = time_score_norm
+                    cand["match_info_score"] = info_score_norm
                 cand["anchor_index"] = anchor_idx
                 cand["anchor_title"] = str(anchor.get("anchor_title", "") or "")
+                cand["ocr_match_text_used"] = capture_text_for_match(cap)
                 if (best_candidate is None) or (score > safe_float(best_candidate.get("match_score"), 0.0)):
                     best_candidate = cand
 
@@ -713,11 +984,38 @@ class KnowledgeGraph:
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[Tuple[str, str, str]] = []
+        self.edge_attrs: Dict[str, Dict[str, Any]] = {}
 
     def add_node(self, node_id: str, payload: Dict[str, Any]) -> None:
         if node_id not in self.nodes:
             self.nodes[node_id] = payload
             return
+
+        if self.nodes[node_id].get("type") == payload.get("type"):
+            old_alias = set(self.nodes[node_id].get("aliases") or [])
+            add_alias = set(payload.get("aliases") or [])
+            if old_alias or add_alias:
+                merged_alias = sorted([a for a in (old_alias | add_alias) if str(a).strip()])
+                self.nodes[node_id]["aliases"] = merged_alias
+
+            if payload.get("canonical"):
+                self.nodes[node_id]["canonical"] = payload.get("canonical")
+
+            if self.nodes[node_id].get("type") == "speaker":
+                old_name = str(self.nodes[node_id].get("name", "") or "")
+                new_name = str(payload.get("name", "") or "")
+                if len(new_name) > len(old_name):
+                    self.nodes[node_id]["name"] = new_name
+            elif self.nodes[node_id].get("type") == "agenda":
+                old_title = str(self.nodes[node_id].get("title", "") or "")
+                new_title = str(payload.get("title", "") or "")
+                if len(new_title) > len(old_title):
+                    self.nodes[node_id]["title"] = new_title
+            elif self.nodes[node_id].get("type") == "topic":
+                old_title = str(self.nodes[node_id].get("title", "") or "")
+                new_title = str(payload.get("title", "") or "")
+                if len(new_title) > len(old_title):
+                    self.nodes[node_id]["title"] = new_title
 
         # merge topic details/evidence
         if self.nodes[node_id].get("type") == "topic" and payload.get("type") == "topic":
@@ -735,13 +1033,39 @@ class KnowledgeGraph:
                 add_seg = set(payload.get("source_segments") or [])
                 self.nodes[node_id]["source_segments"] = sorted(list(old_seg | add_seg))
 
-    def add_edge(self, src: str, rel: str, dst: str) -> None:
-        self.edges.append((src, rel, dst))
+    def _edge_key(self, src: str, rel: str, dst: str) -> str:
+        return f"{src}|{rel}|{dst}"
+
+    def add_edge(self, src: str, rel: str, dst: str, attrs: Optional[Dict[str, Any]] = None) -> None:
+        edge = (src, rel, dst)
+        if edge in self.edges:
+            if attrs:
+                ekey = self._edge_key(src, rel, dst)
+                merged = dict(self.edge_attrs.get(ekey) or {})
+                for k, v in attrs.items():
+                    if k in {"weight", "decay_weight", "semantic_overlap"}:
+                        merged[k] = max(safe_float(merged.get(k), 0.0), safe_float(v, 0.0))
+                    else:
+                        merged[k] = v
+                self.edge_attrs[ekey] = merged
+            return
+        self.edges.append(edge)
+        if attrs:
+            self.edge_attrs[self._edge_key(src, rel, dst)] = dict(attrs)
 
     def add_speaker(self, name: str) -> str:
         name = (name or "Unknown").strip() or "Unknown"
-        nid = f"speaker:{normalize_text(name)}"
-        self.add_node(nid, {"type": "speaker", "name": name})
+        canonical = canonicalize_entity_text("speaker", name) or normalize_text(name)
+        nid = f"speaker:{canonical}"
+        self.add_node(
+            nid,
+            {
+                "type": "speaker",
+                "name": name,
+                "canonical": canonical,
+                "aliases": [name],
+            },
+        )
         return nid
 
     def add_topic(
@@ -752,12 +1076,15 @@ class KnowledgeGraph:
         source_segments: Optional[List[int]] = None,
     ) -> str:
         title = (title or "").strip()
-        nid = f"topic:{normalize_text(title)}"
+        canonical = canonicalize_entity_text("topic", title) or normalize_text(title)
+        nid = f"topic:{canonical}"
         self.add_node(
             nid,
             {
                 "type": "topic",
                 "title": title,
+                "canonical": canonical,
+                "aliases": [title],
                 "details": (details or "").strip(),
                 "evidence": evidence or [],
                 "source_segments": source_segments or [],
@@ -767,8 +1094,76 @@ class KnowledgeGraph:
 
     def add_agenda(self, title: str) -> str:
         title = (title or "").strip()
-        nid = f"agenda:{normalize_text(title)}"
-        self.add_node(nid, {"type": "agenda", "title": title})
+        canonical = canonicalize_entity_text("agenda", title) or normalize_text(title)
+        nid = f"agenda:{canonical}"
+        self.add_node(
+            nid,
+            {
+                "type": "agenda",
+                "title": title,
+                "canonical": canonical,
+                "aliases": [title],
+            },
+        )
+        return nid
+
+    def add_section(
+        self,
+        agenda_title: str,
+        anchor_index: int,
+        anchor_title: str,
+        anchor_kind: str,
+        anchor_text: str = "",
+    ) -> str:
+        agenda_key = canonicalize_entity_text("agenda", agenda_title) or normalize_text(agenda_title)
+        title_key = normalize_text(anchor_title)[:80]
+        nid = f"section:{agenda_key}:{max(0, int(anchor_index))}:{title_key}"
+        self.add_node(
+            nid,
+            {
+                "type": "section",
+                "agenda_title": (agenda_title or "").strip(),
+                "anchor_index": int(max(0, int(anchor_index))),
+                "title": (anchor_title or "").strip(),
+                "kind": (anchor_kind or "summary").strip(),
+                "text_excerpt": (anchor_text or "").strip()[:420],
+            },
+        )
+        return nid
+
+    def add_image(self, capture: Dict[str, Any]) -> str:
+        cap_idx = safe_int(capture.get("capture_index"), 0)
+        ts_ms = safe_int(round(safe_float(capture.get("timestamp_sec"), 0.0) * 1000.0), 0)
+        nid = f"image:{cap_idx}:{ts_ms}"
+        self.add_node(
+            nid,
+            {
+                "type": "image",
+                "capture_index": cap_idx,
+                "timestamp_sec": safe_float(capture.get("timestamp_sec"), 0.0),
+                "timestamp_hms": str(capture.get("timestamp_hms", "") or ""),
+                "image_path": str(capture.get("image_path", "") or ""),
+                "ocr_text": str(capture.get("ocr_text_clean", "") or ""),
+                "ocr_text_focus": str(capture.get("ocr_text_focus", "") or ""),
+                "ocr_text_source_chars": safe_int(capture.get("ocr_text_source_chars"), 0),
+                "ocr_text_kept_chars": safe_int(capture.get("ocr_text_kept_chars"), 0),
+                "ocr_text_truncated_chars": safe_int(capture.get("ocr_text_truncated_chars"), 0),
+                "ocr_text_was_truncated": bool(capture.get("ocr_text_was_truncated")),
+                "match_score": safe_float(capture.get("match_score"), 0.0),
+                "match_mode": str(capture.get("match_mode", "") or ""),
+                "matched_keywords": list(capture.get("matched_keywords") or []),
+                "anchor_index": safe_int(capture.get("anchor_index"), 0),
+                "anchor_title": str(capture.get("anchor_title", "") or ""),
+                "match_hit_count": safe_int(capture.get("match_hit_count"), 0),
+                "match_anchor_cosine": safe_float(capture.get("match_anchor_cosine"), 0.0),
+                "match_context_cosine": safe_float(capture.get("match_context_cosine"), 0.0),
+                "match_anchor_coverage": safe_float(capture.get("match_anchor_coverage"), 0.0),
+                "match_context_coverage": safe_float(capture.get("match_context_coverage"), 0.0),
+                "match_text_score": safe_float(capture.get("match_text_score"), 0.0),
+                "match_time_score": safe_float(capture.get("match_time_score"), 0.0),
+                "match_info_score": safe_float(capture.get("match_info_score"), 0.0),
+            },
+        )
         return nid
 
     def add_action(self, a: ActionEvent) -> str:
@@ -804,11 +1199,19 @@ class KnowledgeGraph:
         return nid
 
     def query_agenda(self, agenda_title: str) -> Dict[str, Any]:
-        aid = f"agenda:{normalize_text(agenda_title)}"
+        aid = f"agenda:{canonicalize_entity_text('agenda', agenda_title) or normalize_text(agenda_title)}"
         if aid not in self.nodes:
-            return {"agenda": None, "speakers": [], "topics": [], "actions": [], "decisions": []}
+            return {
+                "agenda": None,
+                "speakers": [],
+                "topics": [],
+                "actions": [],
+                "decisions": [],
+                "sections": [],
+                "images": [],
+            }
 
-        topic_ids, action_ids, decision_ids, speaker_ids = set(), set(), set(), set()
+        topic_ids, action_ids, decision_ids, section_ids, image_ids, speaker_ids = set(), set(), set(), set(), set(), set()
 
         for s, rel, t in self.edges:
             if s == aid and rel == "has_topic":
@@ -817,10 +1220,16 @@ class KnowledgeGraph:
                 action_ids.add(t)
             elif s == aid and rel == "has_decision":
                 decision_ids.add(t)
+            elif s == aid and rel == "agenda_has_section":
+                section_ids.add(t)
+            elif s == aid and rel == "agenda_has_image":
+                image_ids.add(t)
 
         for s, rel, t in self.edges:
             if rel == "discusses" and t in topic_ids:
                 speaker_ids.add(s)
+            elif rel == "section_has_image" and s in section_ids:
+                image_ids.add(t)
 
         return {
             "agenda": self.nodes[aid],
@@ -828,6 +1237,13 @@ class KnowledgeGraph:
             "topics": [self.nodes[i] for i in topic_ids if i in self.nodes],
             "actions": [self.nodes[i] for i in action_ids if i in self.nodes],
             "decisions": [self.nodes[i] for i in decision_ids if i in self.nodes],
+            "sections": [self.nodes[i] for i in section_ids if i in self.nodes],
+            "images": [self.nodes[i] for i in image_ids if i in self.nodes],
+            "topic_ids": [i for i in topic_ids if i in self.nodes],
+            "action_ids": [i for i in action_ids if i in self.nodes],
+            "decision_ids": [i for i in decision_ids if i in self.nodes],
+            "section_ids": [i for i in section_ids if i in self.nodes],
+            "image_ids": [i for i in image_ids if i in self.nodes],
         }
 
 
@@ -888,7 +1304,7 @@ class OcrAugmentAgent:
     def __init__(self):
         # keep conservative defaults to avoid oversized prompts
         self.max_segments = int(os.getenv("OCR_AUGMENT_MAX_SEGMENTS", "0"))
-        self.min_text_chars = int(os.getenv("OCR_AUGMENT_MIN_TEXT_CHARS", "60"))
+        self.min_text_chars = int(os.getenv("OCR_AUGMENT_MIN_TEXT_CHARS", "40"))
         self.max_chars_per_segment = int(os.getenv("OCR_AUGMENT_MAX_TEXT_CHARS", "1200"))
         self.dedupe_similarity = float(os.getenv("OCR_AUGMENT_DEDUPE_SIMILARITY", "0.90"))
 
@@ -897,6 +1313,8 @@ class OcrAugmentAgent:
         if not isinstance(ocr_raw, dict):
             state["ocr_captures"] = []
             state["ocr_augmented_count"] = 0
+            state["ocr_truncated_capture_count"] = 0
+            state["ocr_truncated_chars_total"] = 0
             return state
 
         transcript = TranscriptJSON.model_validate(state["transcript_json"])
@@ -910,20 +1328,29 @@ class OcrAugmentAgent:
         if not ocr_segments:
             state["ocr_captures"] = []
             state["ocr_augmented_count"] = 0
+            state["ocr_truncated_capture_count"] = 0
+            state["ocr_truncated_chars_total"] = 0
             return state
 
         merged_segments = list(transcript.segments) + list(ocr_segments)
         merged_segments.sort(key=lambda s: safe_float(s.start, 0.0))
         merged_transcript = TranscriptJSON(segments=merged_segments)
 
+        truncated_capture_count = sum(1 for c in ocr_captures if bool(c.get("ocr_text_was_truncated")))
+        truncated_chars_total = sum(safe_int(c.get("ocr_text_truncated_chars"), 0) for c in ocr_captures)
+
         state["transcript_json"] = merged_transcript.model_dump()
         state["transcript_index"] = build_transcript_index(merged_transcript)
         state["ocr_captures"] = ocr_captures
         state["ocr_augmented_count"] = len(ocr_segments)
+        state["ocr_truncated_capture_count"] = int(truncated_capture_count)
+        state["ocr_truncated_chars_total"] = int(truncated_chars_total)
         logger.info(
-            "OCR augment: added %d segments (captures=%d)",
+            "OCR augment: added %d segments (captures=%d, truncated_captures=%d, truncated_chars=%d)",
             len(ocr_segments),
             len(ocr_captures),
+            int(truncated_capture_count),
+            int(truncated_chars_total),
         )
         return state
 
@@ -1115,7 +1542,7 @@ class ExtractorAgent:
                 sp_id = kg.add_speaker(rs)
                 kg.add_edge(sp_id, "discusses", tp_id)
 
-        state["kg"] = {"nodes": kg.nodes, "edges": kg.edges}
+        state["kg"] = {"nodes": kg.nodes, "edges": kg.edges, "edge_attrs": kg.edge_attrs}
         state["actions"] = [a.__dict__ for a in actions]
         state["decisions"] = [d.__dict__ for d in decisions]
         return state
@@ -1294,6 +1721,7 @@ Output JSON:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
 
         for a in actions:
             aid = kg.add_action(a)
@@ -1321,7 +1749,7 @@ Output JSON:
                     if token_overlap_score(ag.title, node.get("title", "")) >= 0.35:
                         kg.add_edge(agid, "has_topic", nid)
 
-        state["kg"] = {"nodes": kg.nodes, "edges": kg.edges}
+        state["kg"] = {"nodes": kg.nodes, "edges": kg.edges, "edge_attrs": kg.edge_attrs}
         return state
 
     async def _repair(self, raw: str, schema: str = "action_links/decision_links") -> Optional[dict]:
@@ -1373,7 +1801,7 @@ class GeneratorAgent:
         self.max_action_rows = int(os.getenv("GEN_MAX_ACTION_ROWS", "20"))
         self.min_evidence_ids = int(os.getenv("GEN_MIN_EVIDENCE_IDS", "12"))
         self.fallback_evidence_topk = int(os.getenv("GEN_FALLBACK_EVIDENCE_TOPK", "40"))
-        self.ocr_max_evidence_lines = int(os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "6"))
+        self.ocr_max_evidence_lines = int(os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "10"))
         self.ocr_min_match_score = float(os.getenv("GEN_OCR_MIN_MATCH_SCORE", "8.0"))
 
         self.max_parallel = int(os.getenv("GEN_MAX_PARALLEL", "3"))
@@ -1582,31 +2010,61 @@ class GeneratorAgent:
         if not query_tokens:
             return []
 
-        scored: List[Tuple[float, Dict[str, Any], List[str]]] = []
+        capture_bag_map: Dict[int, List[str]] = {}
+        token_doc_freq: Counter = Counter()
         for cap in ocr_captures:
-            txt = normalize_text(str(cap.get("ocr_text_clean", "") or ""))
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            cap_text = capture_text_for_match(cap)
+            bag = agenda_match_token_bag(cap_text)
+            capture_bag_map[cap_id] = bag
+            if bag:
+                token_doc_freq.update(set(bag))
+        total_docs = max(1, int(len(capture_bag_map)))
+        specific_df = max(1, int(round(total_docs * 0.35)))
+        rare_df = max(1, int(round(total_docs * 0.20)))
+
+        scored: List[Tuple[float, Dict[str, Any], List[str], List[str]]] = []
+        for cap in ocr_captures:
+            txt = normalize_text(capture_text_for_match(cap))
             if not txt:
                 continue
             hits = [t for t in query_tokens if t in txt]
             if not hits:
                 continue
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            cap_bag = capture_bag_map.get(cap_id) or []
+            specific_hits = [h for h in hits if token_doc_freq.get(h, 0) <= specific_df]
+            rare_entities = [
+                tok
+                for tok in cap_bag
+                if tok not in query_tokens
+                and len(tok) >= 3
+                and re.fullmatch(r"[a-z0-9_./-]{3,}", tok) is not None
+                and re.search(r"[a-z]", tok)
+                and token_doc_freq.get(tok, 0) <= rare_df
+            ]
             score = float(sum(len(h) for h in hits))
+            score += 6.0 * float(len(specific_hits))
+            score += 4.0 * float(len(rare_entities[:3]))
             if score < self.ocr_min_match_score:
                 continue
-            scored.append((score, cap, hits[:5]))
+            scored.append((score, cap, hits[:5], rare_entities[:3]))
 
         if not scored:
             return []
 
         scored.sort(key=lambda x: x[0], reverse=True)
         lines: List[str] = []
-        for score, cap, hits in scored[: self.ocr_max_evidence_lines]:
+        for score, cap, hits, rare_entities in scored[: self.ocr_max_evidence_lines]:
             ts_hms = str(cap.get("timestamp_hms", "") or "")
-            txt = str(cap.get("ocr_text_clean", "") or "").strip()
+            txt = str(capture_text_for_match(cap) or "").strip()
             if len(txt) > 260:
                 txt = txt[:260].rstrip() + "..."
-            hit_text = ", ".join(hits) if hits else "-"
-            lines.append(f"[OCR {ts_hms}] score={score:.1f} kw={hit_text} | {txt}")
+            kw = list(dict.fromkeys([*(hits or []), *(rare_entities or [])]))[:6]
+            hit_text = ", ".join(kw) if kw else "-"
+            cut_chars = safe_int(cap.get("ocr_text_truncated_chars"), 0)
+            cut_text = f" cut={cut_chars}" if cut_chars > 0 else ""
+            lines.append(f"[OCR {ts_hms}] score={score:.1f} kw={hit_text}{cut_text} | {txt}")
         return lines
 
     def _build_outline_prompt(
@@ -1729,6 +2187,7 @@ EVIDENCE:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
 
         sem = asyncio.Semaphore(self.max_parallel)
 
@@ -1975,7 +2434,9 @@ SECTION เดิม:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
         transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
 
         sem = asyncio.Semaphore(self.max_parallel)
 
@@ -1984,6 +2445,9 @@ SECTION เดิม:
                 agenda_data = kg.query_agenda(ag.title)
                 ids = self.helper._collect_evidence_ids(ag, agenda_data, transcript_index)
                 evidence_text = self.helper._build_evidence_text(transcript_index, ids)
+                ocr_lines = self.helper._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
                 current = original_html
                 for round_i in range(self.max_rewrite_rounds + 1):
@@ -2255,7 +2719,9 @@ SECTION เดิม:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
         transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
 
         sem = asyncio.Semaphore(self.max_parallel)
 
@@ -2267,6 +2733,9 @@ SECTION เดิม:
                 agenda_data = kg.query_agenda(ag.title)
                 ids = self.helper._collect_evidence_ids(ag, agenda_data, transcript_index)
                 evidence_text = self.helper._build_evidence_text(transcript_index, ids)
+                ocr_lines = self.helper._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
                 current = section_html
                 for round_i in range(self.max_rewrite_rounds + 1):
@@ -2439,7 +2908,9 @@ SECTION เดิม:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
         transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
 
         sem = asyncio.Semaphore(self.max_parallel)
 
@@ -2450,6 +2921,9 @@ SECTION เดิม:
                 agenda_data = kg.query_agenda(ag.title)
                 ids = self.gen_helper._collect_evidence_ids(ag, agenda_data, transcript_index)
                 evidence_text = self.gen_helper._build_evidence_text(transcript_index, ids)
+                ocr_lines = self.gen_helper._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
                 current = self.gen_helper._clean_html(section_html)
                 for loop_i in range(self.max_loops + 1):
@@ -2600,7 +3074,9 @@ class ReActReviseAgent:
         kg = KnowledgeGraph()
         kg.nodes = state["kg"]["nodes"]
         kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
         transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
         sem = asyncio.Semaphore(self.max_parallel)
 
         async def revise_one(i: int, ag: AgendaItem, section_html: str) -> Tuple[int, str]:
@@ -2614,6 +3090,9 @@ class ReActReviseAgent:
                 agenda_data = kg.query_agenda(ag.title)
                 ids = self.react.gen_helper._collect_evidence_ids(ag, agenda_data, transcript_index)
                 evidence_text = self.react.gen_helper._build_evidence_text(transcript_index, ids)
+                ocr_lines = self.react.gen_helper._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
 
                 logger.info(
                     "ReAct revise node %d/%d loop=%d coverage=%.2f off_scope=%.2f reason=%s",
@@ -2656,6 +3135,12 @@ class OfficialEditorAgent:
         self.max_parallel = int(os.getenv("OFFICIAL_EDITOR_MAX_PARALLEL", "2"))
         self.completion_tokens = int(os.getenv("OFFICIAL_EDITOR_COMPLETION_TOKENS", "2400"))
         self.max_evidence_lines = int(os.getenv("OFFICIAL_EDITOR_EVIDENCE_LINES", "10"))
+        self.ocr_max_evidence_lines = int(
+            os.getenv("OFFICIAL_EDITOR_OCR_EVIDENCE_LINES", os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "10"))
+        )
+        self.ocr_min_match_score = float(
+            os.getenv("OFFICIAL_EDITOR_OCR_MIN_MATCH_SCORE", os.getenv("GEN_OCR_MIN_MATCH_SCORE", "8.0"))
+        )
         self.enabled = os.getenv("REACT_OFFICIAL_EDITOR_ENABLED", "1").lower() not in ("0", "false", "no")
         self.stopwords = {
             "วาระ",
@@ -2792,6 +3277,69 @@ class OfficialEditorAgent:
             out.append(f"[{ts}] {speaker}: {text}")
         return out
 
+    def _collect_ocr_evidence_lines(self, agenda: AgendaItem, ocr_captures: List[Dict[str, Any]]) -> List[str]:
+        if not ocr_captures:
+            return []
+        title_clean = re.sub(r"^วาระที่\s*\d+\s*", "", agenda.title).strip()
+        query_tokens = set(self._token_set(" ".join([title_clean] + (agenda.details or []))))
+        if not query_tokens:
+            return []
+
+        capture_bag_map: Dict[int, List[str]] = {}
+        token_doc_freq: Counter = Counter()
+        for cap in ocr_captures:
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            bag = agenda_match_token_bag(capture_text_for_match(cap))
+            capture_bag_map[cap_id] = bag
+            if bag:
+                token_doc_freq.update(set(bag))
+        total_docs = max(1, int(len(capture_bag_map)))
+        specific_df = max(1, int(round(total_docs * 0.35)))
+        rare_df = max(1, int(round(total_docs * 0.20)))
+
+        scored: List[Tuple[float, Dict[str, Any], List[str], List[str]]] = []
+        for cap in ocr_captures:
+            text_match = normalize_text(capture_text_for_match(cap))
+            if not text_match:
+                continue
+            hits = [kw for kw in query_tokens if kw in text_match]
+            if not hits:
+                continue
+            cap_id = safe_int(cap.get("capture_index"), 0)
+            cap_bag = capture_bag_map.get(cap_id) or []
+            specific_hits = [h for h in hits if token_doc_freq.get(h, 0) <= specific_df]
+            rare_entities = [
+                tok
+                for tok in cap_bag
+                if tok not in query_tokens
+                and len(tok) >= 3
+                and re.fullmatch(r"[a-z0-9_./-]{3,}", tok) is not None
+                and re.search(r"[a-z]", tok)
+                and token_doc_freq.get(tok, 0) <= rare_df
+            ]
+            score = float(sum(len(x) for x in hits))
+            score += 6.0 * float(len(specific_hits))
+            score += 4.0 * float(len(rare_entities[:3]))
+            if score < self.ocr_min_match_score:
+                continue
+            scored.append((score, cap, hits[:5], rare_entities[:3]))
+
+        if not scored:
+            return []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        lines: List[str] = []
+        for score, cap, hits, rare_entities in scored[: max(0, self.ocr_max_evidence_lines)]:
+            ts_hms = str(cap.get("timestamp_hms", "") or "")
+            text = str(capture_text_for_match(cap) or "").strip()
+            if len(text) > 260:
+                text = text[:260].rstrip() + "..."
+            cut_chars = safe_int(cap.get("ocr_text_truncated_chars"), 0)
+            cut_text = f" cut={cut_chars}" if cut_chars > 0 else ""
+            kw = list(dict.fromkeys([*(hits or []), *(rare_entities or [])]))[:6]
+            lines.append(f"[OCR {ts_hms}] score={score:.1f} kw={','.join(kw)}{cut_text} | {text}")
+        return lines
+
     def _build_references(self, parsed: ParsedAgenda, state: "MeetingState") -> Dict[str, Any]:
         agenda_reference = [
             {
@@ -2862,6 +3410,8 @@ Output Format (ต้องมีครบ):
 - ทุกหัวข้อใน "ประเด็นหารือ" ควรมีรายละเอียดอย่างน้อย 1-2 ประโยค
 - ถ้ามีตัวเลข ให้คงค่าตัวเลขตามหลักฐาน
 - หากไม่พบข้อมูลมติหรือ Action ให้ระบุ "ไม่มีข้อมูลชัดเจน"
+- ห้ามลดทอนรายชื่อโครงการ/หน่วยงาน/คำเฉพาะที่มีอยู่ใน Draft Section เว้นแต่ขัดกับ Evidence โดยตรง
+- ถ้ามีคำอังกฤษ/รหัสโครงการใน Draft Section ให้คงรูปสะกดเดิมให้มากที่สุด
 """
         return [
             {"role": "system", "content": system_prompt},
@@ -2881,12 +3431,16 @@ Output Format (ต้องมีครบ):
             return state
 
         transcript = TranscriptJSON.model_validate(state["transcript_json"])
+        ocr_captures = state.get("ocr_captures") or []
         references = self._build_references(parsed, state)
         sem = asyncio.Semaphore(self.max_parallel)
 
         async def rewrite_one(i: int, ag: AgendaItem, sec: str) -> Tuple[int, str]:
             async with sem:
                 evidence_lines = self._collect_evidence_lines(ag, transcript)
+                ocr_lines = self._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_lines = evidence_lines + ocr_lines
                 messages = self._build_messages(ag, sec, evidence_lines, references)
                 resp = await self.client.generate(
                     messages,
@@ -2921,14 +3475,37 @@ def route_react_decision(state: "MeetingState") -> str:
 
 class AssembleAgent:
     def __init__(self):
-        self.image_scoring_mode = str(os.getenv("AGENDA_IMAGE_SCORING", "keyword")).strip().lower()
-        self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "10.0"))
+        self.image_scoring_mode = str(os.getenv("AGENDA_IMAGE_SCORING", "imagemapper")).strip().lower()
+        self.image_min_match_score = float(os.getenv("AGENDA_IMAGE_MIN_MATCH_SCORE", "18.0"))
         self.image_min_hit_tokens = int(os.getenv("AGENDA_IMAGE_MIN_HIT_TOKENS", "2"))
-        self.image_min_cosine_anchor = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_ANCHOR", "0.15"))
-        self.image_min_cosine_context = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_CONTEXT", "0.05"))
-        self.image_max_per_agenda = int(os.getenv("AGENDA_IMAGE_MAX_PER_AGENDA", "3"))
+        self.image_min_cosine_anchor = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_ANCHOR", "0.18"))
+        self.image_min_cosine_context = float(os.getenv("AGENDA_IMAGE_MIN_COSINE_CONTEXT", "0.08"))
+        self.image_common_token_ratio = float(os.getenv("AGENDA_IMAGE_COMMON_TOKEN_RATIO", "0.35"))
+        self.image_common_token_min_docs = int(os.getenv("AGENDA_IMAGE_COMMON_TOKEN_MIN_DOCS", "4"))
+        self.image_max_per_agenda = int(os.getenv("AGENDA_IMAGE_MAX_PER_AGENDA", "2"))
         self.image_max_per_anchor = int(os.getenv("AGENDA_IMAGE_MAX_PER_ANCHOR", "1"))
+        self.image_max_total = int(os.getenv("AGENDA_IMAGE_MAX_TOTAL", "4"))
+        self.image_entity_min_overlap = float(os.getenv("AGENDA_IMAGE_ENTITY_MIN_OVERLAP", "0.08"))
+        self.image_edge_decay_tau_sec = float(os.getenv("AGENDA_IMAGE_EDGE_DECAY_TAU_SEC", "1800"))
         self.image_allow_reuse = str(os.getenv("AGENDA_IMAGE_ALLOW_REUSE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.image_fallback_enabled = str(os.getenv("AGENDA_IMAGE_FALLBACK_ENABLED", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.image_min_total_target = int(os.getenv("AGENDA_IMAGE_MIN_TOTAL_TARGET", "3"))
+        self.image_fallback_scoring_mode = str(os.getenv("AGENDA_IMAGE_FALLBACK_SCORING", "imagemapper")).strip().lower()
+        self.image_fallback_min_match_score = float(os.getenv("AGENDA_IMAGE_FALLBACK_MIN_MATCH_SCORE", "8.0"))
+        self.image_fallback_min_hit_tokens = int(os.getenv("AGENDA_IMAGE_FALLBACK_MIN_HIT_TOKENS", "1"))
+        self.image_fallback_min_cosine_anchor = float(os.getenv("AGENDA_IMAGE_FALLBACK_MIN_COSINE_ANCHOR", "0.05"))
+        self.image_fallback_min_cosine_context = float(os.getenv("AGENDA_IMAGE_FALLBACK_MIN_COSINE_CONTEXT", "0.03"))
+        self.image_fallback_allow_reuse = str(os.getenv("AGENDA_IMAGE_FALLBACK_ALLOW_REUSE", "0")).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -2944,6 +3521,7 @@ class AssembleAgent:
         kg = KnowledgeGraph()
         kg.nodes = (state.get("kg") or {}).get("nodes", {})
         kg.edges = (state.get("kg") or {}).get("edges", [])
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
         agenda_graph_data = [kg.query_agenda(ag.title) for ag in agendas]
         agenda_image_map = pick_related_ocr_capture_lists(
             agendas=agendas,
@@ -2957,7 +3535,24 @@ class AssembleAgent:
             scoring_mode=self.image_scoring_mode,
             min_cosine_anchor=max(0.0, self.image_min_cosine_anchor),
             min_cosine_context=max(0.0, self.image_min_cosine_context),
+            common_token_ratio=max(0.0, min(1.0, self.image_common_token_ratio)),
+            common_token_min_docs=max(2, self.image_common_token_min_docs),
             allow_reuse=self.image_allow_reuse,
+        )
+        agenda_image_map = self._apply_fallback_image_selection(
+            agendas=agendas,
+            sections=sections,
+            ocr_captures=ocr_captures,
+            agenda_graph_data=agenda_graph_data,
+            selected=agenda_image_map,
+        )
+        agenda_image_map = self._apply_global_image_cap(agenda_image_map)
+        kg_image_links_count = self._attach_images_to_kg(
+            kg=kg,
+            agendas=agendas,
+            sections=sections,
+            agenda_graph_data=agenda_graph_data,
+            agenda_image_map=agenda_image_map,
         )
         attendees_html = self._format_attendees(state["attendees_text"])
         header_html = "<br>".join([f"<div>{h}</div>" for h in header_lines])
@@ -3005,9 +3600,293 @@ class AssembleAgent:
   <div class="footer">เอกสารสรุปรายงานการประชุม (อัตโนมัติ)</div>
 </body></html>
 """
+        state["kg"] = {"nodes": kg.nodes, "edges": kg.edges, "edge_attrs": kg.edge_attrs}
+        state["kg_image_links_count"] = kg_image_links_count
         state["final_html"] = final_html
         state["agenda_image_count"] = sum(len(x) for x in agenda_image_map.values())
         return state
+
+    def _apply_global_image_cap(self, agenda_image_map: Dict[int, List[Dict[str, Any]]]) -> Dict[int, List[Dict[str, Any]]]:
+        max_total = int(self.image_max_total)
+        if max_total <= 0:
+            return agenda_image_map
+
+        flat: List[Tuple[float, float, int, Dict[str, Any]]] = []
+        for agenda_idx, caps in agenda_image_map.items():
+            for cap in caps:
+                score = safe_float(cap.get("match_score"), 0.0)
+                ts = safe_float(cap.get("timestamp_sec"), 0.0)
+                flat.append((score, ts, agenda_idx, cap))
+        if len(flat) <= max_total:
+            return agenda_image_map
+
+        flat.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        kept = flat[:max_total]
+        out: Dict[int, List[Dict[str, Any]]] = {}
+        for _, _, agenda_idx, cap in kept:
+            out.setdefault(agenda_idx, []).append(cap)
+        for agenda_idx in out:
+            out[agenda_idx].sort(
+                key=lambda c: (
+                    safe_float(c.get("match_score"), 0.0),
+                    safe_float(c.get("timestamp_sec"), 0.0),
+                ),
+                reverse=True,
+            )
+        return out
+
+    def _apply_fallback_image_selection(
+        self,
+        agendas: List[AgendaItem],
+        sections: List[str],
+        ocr_captures: List[Dict[str, Any]],
+        agenda_graph_data: List[Dict[str, Any]],
+        selected: Dict[int, List[Dict[str, Any]]],
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        if not self.image_fallback_enabled:
+            return selected
+        if not agendas or not ocr_captures:
+            return selected
+
+        current_total = sum(len(v) for v in selected.values())
+        target_total = max(0, int(self.image_min_total_target))
+        if current_total >= target_total:
+            return selected
+
+        missing_idx = [i for i in range(len(agendas)) if not selected.get(i)]
+        if not missing_idx:
+            return selected
+
+        used_ids = {
+            safe_int(cap.get("capture_index"), 0)
+            for caps in selected.values()
+            for cap in (caps or [])
+        }
+        fallback_pool = list(ocr_captures)
+        if used_ids and (not self.image_allow_reuse) and (not self.image_fallback_allow_reuse):
+            fallback_pool = [c for c in ocr_captures if safe_int(c.get("capture_index"), 0) not in used_ids]
+        if not fallback_pool:
+            return selected
+
+        sub_agendas = [agendas[i] for i in missing_idx]
+        sub_sections = [sections[i] if i < len(sections) else "" for i in missing_idx]
+        sub_graph = [agenda_graph_data[i] if i < len(agenda_graph_data) else {} for i in missing_idx]
+
+        fallback_mode = self.image_fallback_scoring_mode
+        if fallback_mode not in {"keyword", "hybrid", "cosine", "imagemapper"}:
+            fallback_mode = "imagemapper"
+
+        fallback_sub = pick_related_ocr_capture_lists(
+            agendas=sub_agendas,
+            sections=sub_sections,
+            ocr_captures=fallback_pool,
+            agenda_graph_data=sub_graph,
+            min_score=self.image_fallback_min_match_score,
+            min_hit_tokens=max(1, self.image_fallback_min_hit_tokens),
+            max_per_agenda=1,
+            max_per_anchor=1,
+            scoring_mode=fallback_mode,
+            min_cosine_anchor=max(0.0, self.image_fallback_min_cosine_anchor),
+            min_cosine_context=max(0.0, self.image_fallback_min_cosine_context),
+            common_token_ratio=max(0.0, min(1.0, self.image_common_token_ratio)),
+            common_token_min_docs=max(2, self.image_common_token_min_docs),
+            allow_reuse=self.image_fallback_allow_reuse,
+        )
+        if not fallback_sub:
+            return selected
+
+        needed = max(0, target_total - current_total)
+        if needed <= 0:
+            return selected
+
+        candidates: List[Tuple[float, int, Dict[str, Any]]] = []
+        for sub_idx, caps in fallback_sub.items():
+            if not caps:
+                continue
+            g_idx = missing_idx[sub_idx]
+            cap = caps[0]
+            score = safe_float(cap.get("match_score"), 0.0)
+            candidates.append((score, g_idx, cap))
+        if not candidates:
+            return selected
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        out: Dict[int, List[Dict[str, Any]]] = {k: list(v) for k, v in selected.items()}
+        added = 0
+        for _, g_idx, cap in candidates:
+            if added >= needed:
+                break
+            existing = out.get(g_idx) or []
+            existing_ids = {safe_int(c.get("capture_index"), 0) for c in existing}
+            cid = safe_int(cap.get("capture_index"), 0)
+            if cid in existing_ids:
+                continue
+            existing.append(cap)
+            out[g_idx] = existing
+            added += 1
+        return out
+
+    def _entity_probe_text(self, node: Dict[str, Any]) -> str:
+        ntype = str(node.get("type", "") or "")
+        if ntype == "topic":
+            return f"{node.get('title', '')} {node.get('details', '')} {' '.join(node.get('evidence') or [])}"
+        if ntype == "action":
+            return f"{node.get('description', '')} {node.get('assignee', '')} {node.get('deadline', '')} {' '.join(node.get('related_topics') or [])} {node.get('evidence', '')}"
+        if ntype == "decision":
+            return f"{node.get('description', '')} {' '.join(node.get('related_topics') or [])} {node.get('evidence', '')}"
+        return ""
+
+    def _attach_images_to_kg(
+        self,
+        kg: KnowledgeGraph,
+        agendas: List[AgendaItem],
+        sections: List[str],
+        agenda_graph_data: List[Dict[str, Any]],
+        agenda_image_map: Dict[int, List[Dict[str, Any]]],
+    ) -> int:
+        edge_count = 0
+        min_overlap = max(0.0, float(self.image_entity_min_overlap))
+        decay_tau = max(60.0, float(self.image_edge_decay_tau_sec))
+        all_ts = [
+            safe_float(c.get("timestamp_sec"), 0.0)
+            for caps in agenda_image_map.values()
+            for c in caps
+        ]
+        max_ts = max(all_ts) if all_ts else 0.0
+
+        def decay_weight(ts_sec: float) -> float:
+            if max_ts <= 0.0:
+                return 1.0
+            dt = max(0.0, max_ts - ts_sec)
+            return float(math.exp(-dt / decay_tau))
+
+        for i, agenda in enumerate(agendas):
+            agid = kg.add_agenda(agenda.title)
+            section_html = sections[i] if i < len(sections) else ""
+            anchors = extract_section_anchors(section_html)
+            section_node_ids: Dict[int, str] = {}
+            for anchor in anchors:
+                anchor_idx = safe_int(anchor.get("anchor_index"), 0)
+                sec_id = kg.add_section(
+                    agenda_title=agenda.title,
+                    anchor_index=anchor_idx,
+                    anchor_title=str(anchor.get("anchor_title", "") or ""),
+                    anchor_kind=str(anchor.get("anchor_kind", "summary") or "summary"),
+                    anchor_text=str(anchor.get("anchor_text", "") or ""),
+                )
+                section_node_ids[anchor_idx] = sec_id
+                before = len(kg.edges)
+                kg.add_edge(agid, "agenda_has_section", sec_id)
+                if len(kg.edges) > before:
+                    edge_count += 1
+
+            caps = agenda_image_map.get(i) or []
+            if not caps:
+                continue
+            agenda_data = (agenda_graph_data[i] if i < len(agenda_graph_data) else {}) or {}
+            topic_ids = [x for x in (agenda_data.get("topic_ids") or []) if x in kg.nodes]
+            action_ids = [x for x in (agenda_data.get("action_ids") or []) if x in kg.nodes]
+            decision_ids = [x for x in (agenda_data.get("decision_ids") or []) if x in kg.nodes]
+
+            for cap in caps:
+                img_id = kg.add_image(cap)
+                cap_ts = safe_float(cap.get("timestamp_sec"), 0.0)
+                cap_score = safe_float(cap.get("match_score"), 0.0)
+                dec_w = decay_weight(cap_ts)
+                base_w = min(1.0, cap_score / 120.0)
+                edge_w = round(max(0.01, base_w * dec_w), 4)
+                before = len(kg.edges)
+                kg.add_edge(
+                    agid,
+                    "agenda_has_image",
+                    img_id,
+                    attrs={
+                        "weight": edge_w,
+                        "match_score": cap_score,
+                        "timestamp_sec": cap_ts,
+                        "decay_weight": round(dec_w, 4),
+                    },
+                )
+                if len(kg.edges) > before:
+                    edge_count += 1
+
+                anchor_idx = safe_int(cap.get("anchor_index"), -1)
+                sec_id = section_node_ids.get(anchor_idx)
+                if sec_id:
+                    before = len(kg.edges)
+                    kg.add_edge(
+                        sec_id,
+                        "section_has_image",
+                        img_id,
+                        attrs={
+                            "weight": edge_w,
+                            "match_score": cap_score,
+                            "timestamp_sec": cap_ts,
+                            "decay_weight": round(dec_w, 4),
+                        },
+                    )
+                    if len(kg.edges) > before:
+                        edge_count += 1
+
+                cap_text = capture_text_for_match(cap)
+                for tid in topic_ids:
+                    probe = self._entity_probe_text(kg.nodes.get(tid, {}))
+                    ov = token_overlap_score(cap_text, probe)
+                    if ov >= min_overlap:
+                        support_w = round(max(0.01, min(1.0, ov * dec_w)), 4)
+                        before = len(kg.edges)
+                        kg.add_edge(
+                            img_id,
+                            "image_supports_topic",
+                            tid,
+                            attrs={
+                                "weight": support_w,
+                                "semantic_overlap": round(ov, 4),
+                                "timestamp_sec": cap_ts,
+                                "decay_weight": round(dec_w, 4),
+                            },
+                        )
+                        if len(kg.edges) > before:
+                            edge_count += 1
+                for aid in action_ids:
+                    probe = self._entity_probe_text(kg.nodes.get(aid, {}))
+                    ov = token_overlap_score(cap_text, probe)
+                    if ov >= min_overlap:
+                        support_w = round(max(0.01, min(1.0, ov * dec_w)), 4)
+                        before = len(kg.edges)
+                        kg.add_edge(
+                            img_id,
+                            "image_supports_action",
+                            aid,
+                            attrs={
+                                "weight": support_w,
+                                "semantic_overlap": round(ov, 4),
+                                "timestamp_sec": cap_ts,
+                                "decay_weight": round(dec_w, 4),
+                            },
+                        )
+                        if len(kg.edges) > before:
+                            edge_count += 1
+                for did in decision_ids:
+                    probe = self._entity_probe_text(kg.nodes.get(did, {}))
+                    ov = token_overlap_score(cap_text, probe)
+                    if ov >= min_overlap:
+                        support_w = round(max(0.01, min(1.0, ov * dec_w)), 4)
+                        before = len(kg.edges)
+                        kg.add_edge(
+                            img_id,
+                            "image_supports_decision",
+                            did,
+                            attrs={
+                                "weight": support_w,
+                                "semantic_overlap": round(ov, 4),
+                                "timestamp_sec": cap_ts,
+                                "decay_weight": round(dec_w, 4),
+                            },
+                        )
+                        if len(kg.edges) > before:
+                            edge_count += 1
+        return edge_count
 
     def _inject_images_into_section(
         self,
@@ -3023,16 +3902,45 @@ class AssembleAgent:
         if not blocks:
             return section_html
 
-        # Place images near actual section content: after each <h4> in order.
         h4_matches = list(re.finditer(r"<h4[^>]*>.*?</h4>", section_html, flags=re.IGNORECASE | re.DOTALL))
         if not h4_matches:
-            return "".join([b for _, b in blocks]) + section_html
+            # No anchor headers: place by best span in full section.
+            insert_map: Dict[int, List[str]] = {}
+            for i, block in blocks:
+                pos = self._pick_sentence_span_insert_pos(
+                    section_html=section_html,
+                    range_start=0,
+                    range_end=len(section_html),
+                    capture=captures[i],
+                )
+                insert_map.setdefault(pos, []).append(block)
 
-        anchors = [m.end() for m in h4_matches]
+            out_parts: List[str] = []
+            cursor = 0
+            for pos in sorted(insert_map.keys()):
+                out_parts.append(section_html[cursor:pos])
+                out_parts.extend(insert_map[pos])
+                cursor = pos
+            out_parts.append(section_html[cursor:])
+            return "".join(out_parts)
+
+        anchor_ranges: List[Tuple[int, int]] = []
+        for i, m in enumerate(h4_matches):
+            body_start = m.end()
+            body_end = h4_matches[i + 1].start() if i + 1 < len(h4_matches) else len(section_html)
+            anchor_ranges.append((body_start, body_end))
+
         insert_map: Dict[int, List[str]] = {}
         for i, block in blocks:
             anchor_idx = safe_int(captures[i].get("anchor_index"), i)
-            pos = anchors[min(max(anchor_idx, 0), len(anchors) - 1)]
+            bounded_anchor_idx = min(max(anchor_idx, 0), len(anchor_ranges) - 1)
+            rstart, rend = anchor_ranges[bounded_anchor_idx]
+            pos = self._pick_sentence_span_insert_pos(
+                section_html=section_html,
+                range_start=rstart,
+                range_end=rend,
+                capture=captures[i],
+            )
             insert_map.setdefault(pos, []).append(block)
 
         out_parts: List[str] = []
@@ -3043,6 +3951,57 @@ class AssembleAgent:
             cursor = pos
         out_parts.append(section_html[cursor:])
         return "".join(out_parts)
+
+    def _pick_sentence_span_insert_pos(
+        self,
+        section_html: str,
+        range_start: int,
+        range_end: int,
+        capture: Dict[str, Any],
+    ) -> int:
+        start = max(0, int(range_start))
+        end = max(start, int(range_end))
+        block_html = section_html[start:end]
+        if not block_html.strip():
+            return end
+
+        cap_text = capture_text_for_match(capture)
+        cap_bag = agenda_match_token_bag(cap_text)
+        cap_tokens = set(cap_bag)
+        if not cap_tokens:
+            return end
+
+        # Place after the most related sentence/span-like block.
+        span_iter = re.finditer(
+            r"(<li[^>]*>.*?</li>|<p[^>]*>.*?</p>|<tr[^>]*>.*?</tr>|<blockquote[^>]*>.*?</blockquote>)",
+            block_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        best_abs_pos = end
+        best_score = 0.0
+        found = False
+        for m in span_iter:
+            span_html = m.group(1)
+            span_text = strip_html_tags(span_html)
+            span_bag = agenda_match_token_bag(span_text)
+            span_tokens = set(span_bag)
+            if not span_tokens:
+                continue
+            kw_score, _, _, _ = keyword_overlap_score(cap_tokens, span_tokens)
+            cos_score = cosine_sim_token_bags(cap_bag, span_bag)
+            span_norm = normalize_text(span_text)
+            phrase_hits = sum(1 for t in cap_tokens if t and t in span_norm)
+            score = (0.65 * kw_score) + (cos_score * 35.0) + (float(phrase_hits) * 8.0)
+            if score <= 0.0:
+                continue
+            if (not found) or (score > best_score):
+                found = True
+                best_score = score
+                best_abs_pos = start + m.end()
+
+        if found:
+            return best_abs_pos
+        return end
 
     def _format_attendees(self, text: str) -> str:
         html = '<div class="attendees-box">'
@@ -3071,8 +4030,11 @@ class AssembleAgent:
         ts_hms = str(capture.get("timestamp_hms", "") or "")
         score = float(capture.get("match_score", 0.0) or 0.0)
         keywords = ", ".join(capture.get("matched_keywords", [])[:4]) if capture.get("matched_keywords") else "-"
+        cut_chars = safe_int(capture.get("ocr_text_truncated_chars"), 0)
         anchor_title = str(capture.get("anchor_title", "") or "").strip()
         caption = f"ภาพประกอบจาก OCR เวลา {ts_hms} | score={score:.1f} | keyword: {keywords}"
+        if cut_chars > 0:
+            caption += f" | cut={cut_chars}"
         if anchor_title:
             caption += f" | section: {anchor_title}"
         return (
@@ -3106,6 +4068,8 @@ class MeetingState(TypedDict, total=False):
     ocr_results_json: Dict[str, Any]
     ocr_captures: List[Dict[str, Any]]
     ocr_augmented_count: int
+    ocr_truncated_capture_count: int
+    ocr_truncated_chars_total: int
 
     parsed_agenda: Dict[str, Any]
     kg: Dict[str, Any]
@@ -3114,6 +4078,7 @@ class MeetingState(TypedDict, total=False):
 
     agenda_sections: List[str]
     agenda_image_count: int
+    kg_image_links_count: int
     final_html: str
 
     react_loop: int

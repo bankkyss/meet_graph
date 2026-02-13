@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: typhoon-2-5-vllm
+  labels:
+    app: typhoon-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: typhoon-vllm
+  template:
+    metadata:
+      labels:
+        app: typhoon-vllm
+    spec:
+      containers:
+      - name: vllm-server
+        # nodeSelector:
+        #   name: l40s-node # ระบุ node ที่มี L40S GPU
+        image: vllm/vllm-openai:latest # หรือระบุเวอร์ชัน เช่น v0.7.0
+        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+          - "--model"
+          - "scb10x/typhoon-v2.5-30b-a3b-instruct"
+          - "--gpu-memory-utilization"
+          - "0.90" # จอง VRAM 90% ของ L40S
+          - "--max-model-len"
+          - "32768" # ปรับตามความเหมาะสมของ Context
+          - "--trust-remote-code"
+        env:
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: token
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: vllm-models-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: typhoon-vllm-service
+spec:
+  selector:
+    app: typhoon-vllm
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: NodePort
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-models-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi 
+  storageClassName: standard-rwo 
