@@ -558,90 +558,6 @@ def detect_change_captures(
     return records, info
 
 
-# ---------------------------------------------------------------------------
-#  Post-OCR quality filters
-# ---------------------------------------------------------------------------
-
-_GALLERY_VIEW_PATTERNS = re.compile(
-    r"(?i)(คุณ|นาย|นาง|นางสาว|ผศ|รศ|ศ\.|ดร\.|อาจารย์|Mr\.|Ms\.|Mrs\.|Dr\.)",
-)
-
-
-def is_gallery_view_capture(
-    ocr_text: str,
-    max_lines: int = 8,
-    max_avg_line_len: int = 40,
-    min_name_ratio: float = 0.5,
-) -> bool:
-    """Return True if the OCR text looks like a gallery-view of participant names.
-
-    Heuristic:
-    - Short text with few lines
-    - Most lines are short (like a person name)
-    - Many lines match Thai/English title patterns
-    """
-    text = (ocr_text or "").strip()
-    if not text:
-        return False
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines or len(lines) > max_lines:
-        return False
-    avg_len = sum(len(ln) for ln in lines) / max(1, len(lines))
-    if avg_len > max_avg_line_len:
-        return False
-    name_hits = sum(1 for ln in lines if _GALLERY_VIEW_PATTERNS.search(ln))
-    return (name_hits / max(1, len(lines))) >= min_name_ratio
-
-
-def is_low_content_capture(
-    ocr_text: str,
-    min_content_chars: int = 80,
-    max_pipe_ratio: float = 0.25,
-) -> bool:
-    """Return True if the OCR text is too low-quality to be useful.
-
-    Catches:
-    - Very short text (< min_content_chars of actual content)
-    - Pipe-heavy table garbage (high ratio of | chars)
-    - Non-Thai/non-relevant text (hallucinated English ads, etc.)
-    """
-    text = (ocr_text or "").strip()
-    if not text:
-        return True  # empty is definitely low content
-    # Strip whitespace and common separators for char count
-    content_chars = re.sub(r"[\s|\-_=+]+", "", text)
-    if len(content_chars) < min_content_chars:
-        return True
-    # Pipe-heavy text (broken table OCR)
-    pipe_count = text.count("|")
-    if pipe_count > 0 and (pipe_count / max(1, len(text))) > max_pipe_ratio:
-        return True
-    return False
-
-
-def apply_post_ocr_quality_filters(
-    records: List[CaptureRecord],
-    filter_gallery: bool = True,
-    filter_low_content: bool = True,
-    min_content_chars: int = 80,
-) -> int:
-    """Tag low-quality captures with ocr_skipped_reason (in-place). Returns count filtered."""
-    filtered = 0
-    for record in records:
-        if record.ocr_skipped_reason:
-            continue  # already skipped
-        text = (record.ocr_text or "").strip()
-        if not text:
-            continue
-        if filter_gallery and is_gallery_view_capture(text):
-            record.ocr_skipped_reason = "gallery_view"
-            filtered += 1
-        elif filter_low_content and is_low_content_capture(text, min_content_chars=min_content_chars):
-            record.ocr_skipped_reason = "low_content"
-            filtered += 1
-    return filtered
-
-
 def normalize_for_compare(text: str) -> str:
     value = (text or "").lower().strip()
     value = re.sub(r"\s+", " ", value)
@@ -722,30 +638,10 @@ def main() -> None:
     parser.add_argument(
         "--ocr-dhash-min-distance",
         type=int,
-        default=8,
-        help="Skip OCR on near-duplicate captures by dHash distance (0 disables). Higher = stricter dedup.",
+        default=4,
+        help="Skip OCR on near-duplicate captures by dHash distance (0 disables).",
     )
     parser.add_argument("--ocr-dedupe-similarity", type=float, default=0.92)
-    parser.add_argument(
-        "--filter-gallery-captures",
-        action="store_true",
-        default=True,
-        help="Filter out gallery-view captures (participant name grids).",
-    )
-    parser.add_argument("--no-filter-gallery-captures", dest="filter_gallery_captures", action="store_false")
-    parser.add_argument(
-        "--filter-low-content",
-        action="store_true",
-        default=True,
-        help="Filter out captures with very little meaningful OCR text.",
-    )
-    parser.add_argument("--no-filter-low-content", dest="filter_low_content", action="store_false")
-    parser.add_argument(
-        "--min-ocr-content-chars",
-        type=int,
-        default=80,
-        help="Minimum non-whitespace chars in OCR text to keep a capture (used by --filter-low-content).",
-    )
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
         "--sampling-mode",
@@ -914,16 +810,6 @@ def main() -> None:
                         )
         if ocr_progress is not None:
             ocr_progress.finish(current=completed, extra="completed")
-
-        # ---- Post-OCR quality filters ----
-        quality_filtered = apply_post_ocr_quality_filters(
-            records,
-            filter_gallery=bool(args.filter_gallery_captures),
-            filter_low_content=bool(args.filter_low_content),
-            min_content_chars=max(10, int(args.min_ocr_content_chars)),
-        )
-        if quality_filtered > 0:
-            print(f"[quality-filter] tagged {quality_filtered} captures as low-quality")
 
     json_path = run_dir / "capture_ocr_results.json"
     txt_path = run_dir / "capture_ocr_compact.txt"

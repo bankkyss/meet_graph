@@ -105,12 +105,27 @@ async def _generate_with_workflow(
         raise HTTPException(status_code=400, detail=f"โครงสร้าง transcript ไม่ถูกต้อง: {str(e)}")
 
     ocr_raw: Optional[dict] = None
-    if ocr_file is not None and (ocr_file.filename or "").strip():
+    ocr_filename = (ocr_file.filename or "").strip() if ocr_file is not None else ""
+    if ocr_file is None:
+        logger.info("No OCR file in request: missing multipart field `ocr_file`")
+    elif not ocr_filename:
+        logger.info("No OCR file in request: `ocr_file` provided but filename is empty")
+    if ocr_file is not None and ocr_filename:
         if not (ocr_file.filename or "").endswith(".json"):
             raise HTTPException(status_code=400, detail="ไฟล์ OCR ต้องเป็น .json")
         try:
             ocr_content = await ocr_file.read()
             ocr_candidate = json.loads(ocr_content.decode("utf-8"))
+            if isinstance(ocr_candidate, dict):
+                cap_preview = ocr_candidate.get("captures")
+                cap_count = len(cap_preview) if isinstance(cap_preview, list) else 0
+                logger.info(
+                    "OCR candidate loaded (keys=%s, captures=%d)",
+                    sorted(list(ocr_candidate.keys())),
+                    cap_count,
+                )
+            else:
+                logger.info("OCR candidate loaded (type=%s)", type(ocr_candidate).__name__)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"ไฟล์ OCR JSON ไม่ถูกต้อง: {str(e)}")
         if not isinstance(ocr_candidate, dict):
@@ -118,6 +133,10 @@ async def _generate_with_workflow(
         captures = ocr_candidate.get("captures")
         if captures is not None and not isinstance(captures, list):
             raise HTTPException(status_code=400, detail="ไฟล์ OCR JSON field `captures` ต้องเป็น list")
+        if captures is None:
+            logger.info("OCR JSON has no `captures` field; OCR augment may be zero")
+        elif isinstance(captures, list) and len(captures) == 0:
+            logger.info("OCR JSON `captures` is empty; OCR augment will be zero")
         ocr_raw = ocr_candidate
 
     init_state: MeetingState = {
@@ -128,6 +147,10 @@ async def _generate_with_workflow(
     }
     if ocr_raw is not None:
         init_state["ocr_results_json"] = ocr_raw
+        cap_count = len(ocr_raw.get("captures", [])) if isinstance(ocr_raw.get("captures"), list) else 0
+        logger.info("OCR results included in init state (captures=%d)", cap_count)
+    else:
+        logger.info("OCR results not included in init state")
     return await JOB_SERVICE.create_and_start(
         workflow=workflow,
         workflow_tag=workflow_tag,
@@ -161,6 +184,9 @@ async def generate_report_react(
     file: UploadFile = File(...),
     ocr_file: Optional[UploadFile] = File(None),
 ):
+    if ocr_file is not None and (ocr_file.filename or "").strip():
+        logger.info("OCR file received on /generate_react")
+    
     return await _generate_with_workflow(
         workflow=WORKFLOW_REACT,
         workflow_tag="react_reflexion",

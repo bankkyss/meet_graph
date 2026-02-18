@@ -6,71 +6,150 @@ import logging
 import math
 import os
 import re
+import ssl
+import tempfile
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from services.workflow_types import (
+    ActionEvent,
+    AgendaItem,
+    DecisionEvent,
+    MeetingState,
+    ParsedAgenda,
+    TranscriptJSON,
+    TranscriptSegment,
+)
 
 logger = logging.getLogger("meeting_minutes_full")
 
 # =========================
-# Models
-# =========================
-class TranscriptSegment(BaseModel):
-    speaker: Optional[str] = "Unknown"
-    text: str = ""
-    start: Optional[float] = None
-    end: Optional[float] = None
-
-
-class TranscriptJSON(BaseModel):
-    segments: List[TranscriptSegment] = Field(default_factory=list)
-
-
-class AgendaItem(BaseModel):
-    title: str
-    details: List[str] = Field(default_factory=list)
-
-
-class ParsedAgenda(BaseModel):
-    header_lines: List[str] = Field(default_factory=list)
-    agendas: List[AgendaItem] = Field(default_factory=list)
-
-
-@dataclass
-class ActionEvent:
-    description: str
-    assignee: Optional[str] = None
-    deadline: Optional[str] = None
-    evidence: Optional[str] = None
-    source_segments: List[int] = None
-    related_topics: List[str] = None
-    linked_agenda: Optional[str] = None
-
-
-@dataclass
-class DecisionEvent:
-    description: str
-    evidence: Optional[str] = None
-    source_segments: List[int] = None
-    related_topics: List[str] = None
-    linked_agenda: Optional[str] = None
-
-
-# =========================
 # Utilities
 # =========================
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+@lru_cache(maxsize=1)
+def build_ocr_image_ssl_context() -> Tuple[ssl.SSLContext, bool]:
+    verify = env_flag("OCR_IMAGE_SSL_VERIFY", True)
+    cafile = str(os.getenv("OCR_IMAGE_CA_BUNDLE", "") or "").strip()
+    capath = str(os.getenv("OCR_IMAGE_CA_PATH", "") or "").strip()
+
+    if not verify:
+        logger.warning("OCR image SSL verification disabled via OCR_IMAGE_SSL_VERIFY=0")
+        return ssl._create_unverified_context(), False
+
+    kwargs: Dict[str, str] = {}
+    if cafile:
+        kwargs["cafile"] = cafile
+    if capath:
+        kwargs["capath"] = capath
+    try:
+        ctx = ssl.create_default_context(**kwargs)
+        if kwargs:
+            logger.info(
+                "OCR image SSL verify enabled with custom CA (cafile=%s capath=%s)",
+                cafile or "-",
+                capath or "-",
+            )
+        return ctx, True
+    except Exception as exc:
+        logger.warning(
+            "OCR image SSL context setup failed (cafile=%s capath=%s): %s; fallback to system trust store",
+            cafile or "-",
+            capath or "-",
+            exc,
+        )
+        return ssl.create_default_context(), True
+
+
 def normalize_text(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[“”\"'`]", "", s)
     return s
+
+
+def read_http_error_body(err: HTTPError, max_chars: int = 320) -> str:
+    try:
+        raw = err.read(max_chars + 1)
+    except Exception:
+        return ""
+    text = raw.decode("utf-8", errors="ignore")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text
+
+
+@lru_cache(maxsize=1)
+def load_ocr_image_fetch_headers() -> Dict[str, str]:
+    raw = str(os.getenv("OCR_IMAGE_FETCH_HEADERS_JSON", "") or "").strip()
+    headers: Dict[str, str] = {"User-Agent": "meeting-minutes-api/1.0"}
+    if not raw:
+        return headers
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:
+        logger.warning("Invalid OCR_IMAGE_FETCH_HEADERS_JSON: %s", exc)
+        return headers
+    if not isinstance(obj, dict):
+        logger.warning("Invalid OCR_IMAGE_FETCH_HEADERS_JSON: must be JSON object")
+        return headers
+    for k, v in obj.items():
+        key = str(k or "").strip()
+        val = str(v or "").strip()
+        if key and val:
+            headers[key] = val
+    return headers
+
+
+def presigned_url_expiry_hint(url: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        query = urlparse(url).query
+        if not query:
+            return out
+        pairs: Dict[str, str] = {}
+        for token in query.split("&"):
+            if "=" not in token:
+                continue
+            k, v = token.split("=", 1)
+            pairs[k] = v
+        amz_date = pairs.get("X-Amz-Date", "") or pairs.get("x-amz-date", "")
+        amz_expires = pairs.get("X-Amz-Expires", "") or pairs.get("x-amz-expires", "")
+        if not amz_date or not amz_expires:
+            return out
+        issued_at = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        ttl_sec = max(0, int(amz_expires))
+        expires_at = issued_at + timedelta(seconds=ttl_sec)
+        now = datetime.now(timezone.utc)
+        remain = int((expires_at - now).total_seconds())
+        out["issued_at"] = issued_at.isoformat()
+        out["expires_at"] = expires_at.isoformat()
+        out["seconds_remaining"] = remain
+        out["expired"] = remain < 0
+    except Exception:
+        return {}
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -338,12 +417,16 @@ def parse_ocr_results_for_workflow(
                 end=ts_sec + 0.4,
             )
         )
-        accepted_captures.append(
+        accepted_capture = dict(item)
+        accepted_capture.update(
             {
                 "capture_index": capture_idx,
                 "timestamp_sec": ts_sec,
                 "timestamp_hms": ts_hms,
                 "image_path": str(item.get("image_path", "") or ""),
+                "image_key": str(item.get("image_key", "") or ""),
+                "image_url": str(item.get("image_url", "") or ""),
+                "image_presigned_url": str(item.get("image_presigned_url", "") or ""),
                 "ocr_text_clean": text,
                 "ocr_text_focus": focus_text or text,
                 "ocr_text_source_chars": len(full_clean_text),
@@ -352,6 +435,7 @@ def parse_ocr_results_for_workflow(
                 "ocr_text_was_truncated": bool(truncated_chars > 0),
             }
         )
+        accepted_captures.append(accepted_capture)
         accepted_texts.append(text)
 
         if max_segments > 0 and len(ocr_segments) >= max_segments:
@@ -856,8 +940,9 @@ class TyphoonClient:
         if not api_key:
             raise ValueError("Missing TYPHOON_API_KEY")
 
-        self.client = AsyncOpenAI(api_key=api_key, base_url="https://api.opentyphoon.ai/v1")
-        self.model = os.getenv("TYPHOON_MODEL", "typhoon-v2.5-30b-a3b-instruct")
+        # self.client = AsyncOpenAI(api_key=api_key, base_url="https://api.opentyphoon.ai/v1")
+        self.client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("TYPHOON_API_BASE_URL", "http://172.20.12.7:31319/v1"))
+        self.model = os.getenv("TYPHOON_MODEL", "scb10x/typhoon2.5-qwen3-30b-a3b")
 
         self.max_retries = int(os.getenv("TYPHOON_MAX_RETRIES", "3"))
         self.base_backoff = float(os.getenv("TYPHOON_BACKOFF_SEC", "1.0"))
@@ -1309,6 +1394,11 @@ Output JSON:
 """}
         ]
         resp = await self.client.generate(messages, temperature=0.2, completion_tokens=1200)
+        logger.info(
+            "Raw AgendaParserAgent response (chars=%d)",
+            len(resp or ""),
+            # (resp or "")[:1500],
+        )
         data = try_parse_json(resp)
         if not data:
             data = await self._repair(resp)
@@ -1341,6 +1431,194 @@ class OcrAugmentAgent:
         self.min_text_chars = int(os.getenv("OCR_AUGMENT_MIN_TEXT_CHARS", "40"))
         self.max_chars_per_segment = int(os.getenv("OCR_AUGMENT_MAX_TEXT_CHARS", "1200"))
         self.dedupe_similarity = float(os.getenv("OCR_AUGMENT_DEDUPE_SIMILARITY", "0.90"))
+        self.prefetch_all_images = str(os.getenv("OCR_PREFETCH_ALL_IMAGES", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.prefetch_timeout_sec = float(os.getenv("OCR_PREFETCH_TIMEOUT_SEC", "8.0"))
+        self.prefetch_max_bytes = int(os.getenv("OCR_PREFETCH_MAX_BYTES", str(8 * 1024 * 1024)))
+        self.prefetch_dir = str(os.getenv("OCR_PREFETCH_DIR", "/tmp/ocr_prefetch") or "/tmp/ocr_prefetch")
+        self.prefetch_ssl_context, self.prefetch_ssl_verify = build_ocr_image_ssl_context()
+        self.prefetch_request_headers = load_ocr_image_fetch_headers()
+
+    def _resolve_local_image_path(self, image_path: str) -> Optional[Path]:
+        if not image_path:
+            return None
+        p = Path(image_path)
+        if p.exists():
+            return p
+        if not p.is_absolute():
+            alt = Path.cwd() / p
+            if alt.exists():
+                return alt
+        return None
+
+    def _pick_remote_url(self, cap: Dict[str, Any]) -> str:
+        for key in ("image_presigned_url", "image_url"):
+            value = str(cap.get(key, "") or "").strip()
+            if not value:
+                continue
+            scheme = urlparse(value).scheme.lower()
+            if scheme in {"http", "https"}:
+                return value
+        return ""
+
+    def _guess_ext_from_remote(self, content_type: str, url: str) -> str:
+        mime = str(content_type or "").split(";", 1)[0].strip().lower()
+        if mime == "image/png":
+            return ".png"
+        if mime == "image/webp":
+            return ".webp"
+        if mime == "image/gif":
+            return ".gif"
+        if mime in {"image/jpeg", "image/jpg"}:
+            return ".jpg"
+        path = urlparse(url).path or ""
+        suffix = Path(path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            return ".jpg" if suffix == ".jpeg" else suffix
+        return ".jpg"
+
+    def _prefetch_ocr_images(self, captures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not captures:
+            return captures
+
+        prefetch_root = Path(self.prefetch_dir)
+        prefetch_root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run_", dir=str(prefetch_root)))
+        ssl_failed_hosts: set = set()
+        forbidden_hosts_logged: set = set()
+
+        timeout_sec = max(1.0, float(self.prefetch_timeout_sec))
+        max_bytes = max(1024, int(self.prefetch_max_bytes))
+        local_ok = 0
+        downloaded = 0
+        missing = 0
+        too_large = 0
+        failed = 0
+
+        for cap in captures:
+            if not isinstance(cap, dict):
+                continue
+            cap_idx = safe_int(cap.get("capture_index"), 0)
+            local_path = self._resolve_local_image_path(str(cap.get("image_path", "") or ""))
+            if local_path is not None:
+                cap["image_path"] = str(local_path)
+                cap["image_prefetch_status"] = "local_exists"
+                local_ok += 1
+                continue
+
+            remote_url = self._pick_remote_url(cap)
+            if not remote_url:
+                cap["image_prefetch_status"] = "missing_source"
+                missing += 1
+                continue
+
+            host = str(urlparse(remote_url).netloc or "").lower()
+            if self.prefetch_ssl_verify and host and host in ssl_failed_hosts:
+                cap["image_prefetch_status"] = "fetch_error"
+                cap["image_prefetch_error"] = "skip_host_after_ssl_verify_failed"
+                failed += 1
+                continue
+
+            req = Request(remote_url, headers=self.prefetch_request_headers)
+            try:
+                with urlopen(req, timeout=timeout_sec, context=self.prefetch_ssl_context) as resp:
+                    content_type = str(resp.headers.get("Content-Type", "") or "")
+                    data = resp.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        cap["image_prefetch_status"] = "too_large"
+                        cap["image_prefetch_error"] = f"image too large > {max_bytes} bytes"
+                        too_large += 1
+                        continue
+
+                    ext = self._guess_ext_from_remote(content_type, remote_url)
+                    out_path = run_dir / f"capture_{cap_idx:04d}{ext}"
+                    if out_path.exists():
+                        out_path = run_dir / f"capture_{cap_idx:04d}_{downloaded:03d}{ext}"
+                    out_path.write_bytes(data)
+                    cap["image_path"] = str(out_path)
+                    cap["image_prefetch_status"] = "downloaded"
+                    cap["image_prefetch_bytes"] = len(data)
+                    cap["image_prefetch_content_type"] = content_type
+                    downloaded += 1
+            except HTTPError as exc:
+                cap["image_prefetch_status"] = "fetch_error"
+                cap["image_prefetch_http_status"] = int(exc.code)
+                body = read_http_error_body(exc)
+                hint = presigned_url_expiry_hint(remote_url)
+                hint_tokens: List[str] = []
+                if hint.get("expired"):
+                    hint_tokens.append("presigned_expired")
+                body_l = body.lower()
+                if "request has expired" in body_l or "expiredtoken" in body_l:
+                    hint_tokens.append("expired_token")
+                if "signaturedoesnotmatch" in body_l:
+                    hint_tokens.append("signature_mismatch")
+                if "accessdenied" in body_l:
+                    hint_tokens.append("access_denied")
+                hint_text = ",".join(dict.fromkeys(hint_tokens))
+                cap["image_prefetch_error"] = f"http_{int(exc.code)}" + (f":{hint_text}" if hint_text else "")
+                if body:
+                    cap["image_prefetch_http_body"] = body[:240]
+                failed += 1
+
+                if int(exc.code) == 403 and host:
+                    if host not in forbidden_hosts_logged:
+                        forbidden_hosts_logged.add(host)
+                        logger.warning(
+                            "OCR prefetch HTTP error (capture=%d status=%d host=%s hint=%s expires_at=%s remain_sec=%s): %s",
+                            cap_idx,
+                            int(exc.code),
+                            host or "-",
+                            hint_text or "-",
+                            str(hint.get("expires_at", "-")),
+                            str(hint.get("seconds_remaining", "-")),
+                            body or str(exc),
+                        )
+                else:
+                    logger.warning(
+                        "OCR prefetch HTTP error (capture=%d status=%d host=%s hint=%s expires_at=%s remain_sec=%s): %s",
+                        cap_idx,
+                        int(exc.code),
+                        host or "-",
+                        hint_text or "-",
+                        str(hint.get("expires_at", "-")),
+                        str(hint.get("seconds_remaining", "-")),
+                        body or str(exc),
+                    )
+            except Exception as exc:
+                cap["image_prefetch_status"] = "fetch_error"
+                cap["image_prefetch_error"] = str(exc)[:240]
+                failed += 1
+                err = str(exc)
+                is_ssl_verify_failed = "CERTIFICATE_VERIFY_FAILED" in err
+                if is_ssl_verify_failed and self.prefetch_ssl_verify and host:
+                    if host not in ssl_failed_hosts:
+                        ssl_failed_hosts.add(host)
+                        logger.warning(
+                            "OCR prefetch SSL verify failed (host=%s, capture=%d): %s; "
+                            "set OCR_IMAGE_CA_BUNDLE/OCR_IMAGE_CA_PATH or OCR_IMAGE_SSL_VERIFY=0",
+                            host,
+                            cap_idx,
+                            exc,
+                        )
+                else:
+                    logger.warning("OCR prefetch failed (capture=%d): %s", cap_idx, exc)
+
+        logger.info(
+            "OCR prefetch summary: total=%d local=%d downloaded=%d missing=%d too_large=%d failed=%d dir=%s",
+            len(captures),
+            local_ok,
+            downloaded,
+            missing,
+            too_large,
+            failed,
+            str(run_dir),
+        )
+        return captures
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
         ocr_raw = state.get("ocr_results_json")
@@ -1351,15 +1629,52 @@ class OcrAugmentAgent:
             state["ocr_truncated_chars_total"] = 0
             return state
 
+        ocr_results_for_parse = ocr_raw
+        raw_captures = (ocr_raw or {}).get("captures")
+        raw_capture_count = len(raw_captures) if isinstance(raw_captures, list) else 0
+        if isinstance(raw_captures, list):
+            src_presigned = sum(
+                1 for c in raw_captures
+                if isinstance(c, dict) and str(c.get("image_presigned_url", "") or "").strip()
+            )
+            src_url = sum(
+                1 for c in raw_captures
+                if isinstance(c, dict) and str(c.get("image_url", "") or "").strip()
+            )
+            src_key = sum(
+                1 for c in raw_captures
+                if isinstance(c, dict) and str(c.get("image_key", "") or "").strip()
+            )
+            logger.info(
+                "OCR capture image source fields: total=%d presigned=%d image_url=%d image_key=%d",
+                raw_capture_count,
+                src_presigned,
+                src_url,
+                src_key,
+            )
+        if self.prefetch_all_images:
+            if isinstance(raw_captures, list) and raw_captures:
+                prefetched_captures = self._prefetch_ocr_images(list(raw_captures))
+                ocr_results_for_parse = dict(ocr_raw)
+                ocr_results_for_parse["captures"] = prefetched_captures
+            else:
+                logger.info(
+                    "OCR prefetch skipped: no captures in OCR payload",
+                )
+
         transcript = TranscriptJSON.model_validate(state["transcript_json"])
         ocr_segments, ocr_captures = parse_ocr_results_for_workflow(
-            ocr_results=ocr_raw,
+            ocr_results=ocr_results_for_parse,
             max_segments=max(0, self.max_segments),
             min_text_chars=max(1, self.min_text_chars),
             max_chars_per_segment=max(80, self.max_chars_per_segment),
             dedupe_similarity=self.dedupe_similarity,
         )
         if not ocr_segments:
+            logger.info(
+                "OCR augment produced no usable segments (raw_captures=%d)",
+                raw_capture_count,
+            )
             state["ocr_captures"] = []
             state["ocr_augmented_count"] = 0
             state["ocr_truncated_capture_count"] = 0
@@ -1475,7 +1790,7 @@ class ExtractorAgent:
         overlap = int(os.getenv("EXTRACT_OVERLAP_SEGMENTS", "5"))
         chunks = self._chunk_segments(transcript.segments, max_segments=max_segments, overlap=overlap)
 
-        max_parallel = int(os.getenv("EXTRACT_MAX_PARALLEL", "3"))
+        max_parallel = int(os.getenv("EXTRACT_MAX_PARALLEL", "1"))
         sem = asyncio.Semaphore(max_parallel)
 
         speaker_map: Dict[str, Dict[str, Any]] = {}
@@ -3545,6 +3860,22 @@ class AssembleAgent:
             "yes",
             "on",
         }
+        self.image_remote_fetch_timeout_sec = float(os.getenv("AGENDA_IMAGE_REMOTE_FETCH_TIMEOUT_SEC", "8.0"))
+        self.image_remote_fetch_max_bytes = int(os.getenv("AGENDA_IMAGE_REMOTE_FETCH_MAX_BYTES", str(8 * 1024 * 1024)))
+        self.image_remote_fetch_enabled = str(os.getenv("AGENDA_IMAGE_REMOTE_FETCH_ENABLED", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.image_debug = str(os.getenv("AGENDA_IMAGE_DEBUG", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.image_ssl_context, self.image_ssl_verify = build_ocr_image_ssl_context()
+        self.image_request_headers = load_ocr_image_fetch_headers()
 
     def __call__(self, state: "MeetingState") -> "MeetingState":
         parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
@@ -3573,6 +3904,7 @@ class AssembleAgent:
             common_token_min_docs=max(2, self.image_common_token_min_docs),
             allow_reuse=self.image_allow_reuse,
         )
+        selected_initial = sum(len(v) for v in agenda_image_map.values())
         agenda_image_map = self._apply_fallback_image_selection(
             agendas=agendas,
             sections=sections,
@@ -3580,7 +3912,17 @@ class AssembleAgent:
             agenda_graph_data=agenda_graph_data,
             selected=agenda_image_map,
         )
+        selected_after_fallback = sum(len(v) for v in agenda_image_map.values())
         agenda_image_map = self._apply_global_image_cap(agenda_image_map)
+        selected_final = sum(len(v) for v in agenda_image_map.values())
+        self._log_image_debug(
+            "Agenda image selection summary: ocr_captures=%d initial=%d after_fallback=%d final=%d",
+            len(ocr_captures),
+            selected_initial,
+            selected_after_fallback,
+            selected_final,
+        )
+        self._log_agenda_image_selection_details(agendas, agenda_image_map)
         kg_image_links_count = self._attach_images_to_kg(
             kg=kg,
             agendas=agendas,
@@ -3614,6 +3956,8 @@ class AssembleAgent:
     .agenda-image-wrap {{ margin: 10px 0 14px; border: 1px solid #d4d4d4; background: #fafafa; border-radius: 8px; overflow: hidden; }}
     .agenda-image-wrap img {{ width: 100%; height: auto; display: block; background: #111; }}
     .agenda-image-caption {{ font-size: 0.86em; color: #333; padding: 7px 10px; border-top: 1px solid #ddd; }}
+    .agenda-image-link {{ font-size: 0.84em; padding: 0 10px 9px; }}
+    .agenda-image-link a {{ color: #0a58ca; text-decoration: underline; }}
     .footer {{ text-align: center; color: #333; font-size: 0.85em; margin-top: 28px; border-top: 1px solid #aaa; padding-top: 10px; }}
   </style>
   <title>รายงานการประชุม</title>
@@ -3640,6 +3984,45 @@ class AssembleAgent:
         state["agenda_image_count"] = sum(len(x) for x in agenda_image_map.values())
         state["agenda_image_map"] = {int(k): v for k, v in agenda_image_map.items()}
         return state
+
+    def _log_image_debug(self, msg: str, *args: Any) -> None:
+        if self.image_debug:
+            logger.info(msg, *args)
+
+    def _log_agenda_image_selection_details(
+        self,
+        agendas: List[AgendaItem],
+        agenda_image_map: Dict[int, List[Dict[str, Any]]],
+    ) -> None:
+        if not self.image_debug:
+            return
+        for agenda_idx, agenda in enumerate(agendas):
+            caps = agenda_image_map.get(agenda_idx) or []
+            if not caps:
+                logger.info(
+                    "Agenda image selection: agenda=%d title=%s selected=0",
+                    agenda_idx + 1,
+                    agenda.title,
+                )
+                continue
+            cap_logs: List[str] = []
+            for cap in caps:
+                cap_idx = safe_int(cap.get("capture_index"), 0)
+                ts_hms = str(cap.get("timestamp_hms", "") or "")
+                score = safe_float(cap.get("match_score"), 0.0)
+                has_url = bool(str(cap.get("image_url", "") or "").strip())
+                has_purl = bool(str(cap.get("image_presigned_url", "") or "").strip())
+                has_path = bool(str(cap.get("image_path", "") or "").strip())
+                cap_logs.append(
+                    f"id={cap_idx} ts={ts_hms} score={score:.1f} url={int(has_url)} purl={int(has_purl)} path={int(has_path)}"
+                )
+            logger.info(
+                "Agenda image selection: agenda=%d title=%s selected=%d -> %s",
+                agenda_idx + 1,
+                agenda.title,
+                len(caps),
+                " | ".join(cap_logs),
+            )
 
     def _apply_global_image_cap(self, agenda_image_map: Dict[int, List[Dict[str, Any]]]) -> Dict[int, List[Dict[str, Any]]]:
         max_total = int(self.image_max_total)
@@ -3930,12 +4313,27 @@ class AssembleAgent:
         agenda_index: int,
     ) -> str:
         if not captures:
+            self._log_image_debug(
+                "Inject images skipped: agenda=%d reason=no_captures",
+                agenda_index + 1,
+            )
             return section_html
 
         blocks = [self._build_agenda_image_block(c, agenda_index) for c in captures]
         blocks = [(i, b) for i, b in enumerate(blocks) if b]
         if not blocks:
+            self._log_image_debug(
+                "Inject images skipped: agenda=%d reason=no_renderable_blocks captures=%d",
+                agenda_index + 1,
+                len(captures),
+            )
             return section_html
+        self._log_image_debug(
+            "Inject images: agenda=%d captures=%d renderable_blocks=%d",
+            agenda_index + 1,
+            len(captures),
+            len(blocks),
+        )
 
         h4_matches = list(re.finditer(r"<h4[^>]*>.*?</h4>", section_html, flags=re.IGNORECASE | re.DOTALL))
         if not h4_matches:
@@ -4051,16 +4449,21 @@ class AssembleAgent:
         return html
 
     def _build_agenda_image_block(self, capture: Dict[str, Any], agenda_index: int) -> str:
-        image_path = self._resolve_image_path(str(capture.get("image_path", "") or ""))
-        if not image_path:
+        capture_index = safe_int(capture.get("capture_index"), 0)
+        img_src, src_kind = self._resolve_capture_image_src(capture)
+        if not img_src:
+            logger.warning(
+                "Image block skipped: agenda=%d capture=%d reason=no_usable_image_source",
+                agenda_index + 1,
+                capture_index,
+            )
             return ""
-
-        img_src = ""
-        try:
-            b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-            img_src = f"data:image/jpeg;base64,{b64}"
-        except Exception:
-            img_src = html_lib.escape(str(image_path))
+        self._log_image_debug(
+            "Image block created: agenda=%d capture=%d src=%s",
+            agenda_index + 1,
+            capture_index,
+            src_kind,
+        )
 
         ts_hms = str(capture.get("timestamp_hms", "") or "")
         score = float(capture.get("match_score", 0.0) or 0.0)
@@ -4072,15 +4475,175 @@ class AssembleAgent:
             caption += f" | cut={cut_chars}"
         if anchor_title:
             caption += f" | section: {anchor_title}"
+        link_html = ""
+        if src_kind.startswith("remote_url_direct"):
+            link_html = (
+                '<div class="agenda-image-link">'
+                f'<a href="{img_src}" target="_blank" rel="noopener noreferrer">เปิดรูปต้นฉบับ</a>'
+                "</div>"
+            )
         return (
             '<div class="agenda-image-wrap">'
             f'<img src="{img_src}" alt="agenda-{agenda_index+1}-ocr-image" loading="lazy"/>'
             f'<div class="agenda-image-caption">{html_lib.escape(caption)}</div>'
+            f"{link_html}"
             "</div>\n"
         )
 
+    def _resolve_capture_image_src(self, capture: Dict[str, Any]) -> Tuple[str, str]:
+        capture_index = safe_int(capture.get("capture_index"), 0)
+        remote_url = self._pick_capture_remote_url(capture)
+        if remote_url:
+            if not self.image_remote_fetch_enabled:
+                self._log_image_debug(
+                    "Image source forced direct URL: capture=%d",
+                    capture_index,
+                )
+                return html_lib.escape(remote_url), "remote_url_direct_no_fetch"
+            remote_bytes, content_type = self._fetch_remote_image_bytes(
+                url=remote_url,
+                capture_index=capture_index,
+            )
+            if remote_bytes:
+                self._log_image_debug(
+                    "Image source resolved: capture=%d via=remote_fetch bytes=%d content_type=%s",
+                    capture_index,
+                    len(remote_bytes),
+                    content_type or "-",
+                )
+                return self._image_bytes_to_data_url(remote_bytes, content_type=content_type), "remote_fetch"
+            self._log_image_debug(
+                "Image source fallback: capture=%d via=remote_url_direct url=%s",
+                capture_index,
+                remote_url,
+            )
+            return html_lib.escape(remote_url), "remote_url_direct"
+
+        image_path = self._resolve_image_path(str(capture.get("image_path", "") or ""))
+        if not image_path:
+            self._log_image_debug(
+                "Image source missing: capture=%d no_remote_url_and_path_not_found",
+                capture_index,
+            )
+            return "", "none"
+        try:
+            raw = image_path.read_bytes()
+            self._log_image_debug(
+                "Image source resolved: capture=%d via=local_path path=%s bytes=%d",
+                capture_index,
+                str(image_path),
+                len(raw),
+            )
+            return self._image_bytes_to_data_url(
+                raw,
+                content_type=self._guess_image_content_type_from_path(image_path),
+            ), "local_path"
+        except Exception as exc:
+            logger.warning(
+                "Cannot read OCR local image path (capture=%d, path=%s): %s",
+                capture_index,
+                str(image_path),
+                exc,
+            )
+            return html_lib.escape(str(image_path)), "local_path_text_fallback"
+
+    def _pick_capture_remote_url(self, capture: Dict[str, Any]) -> str:
+        # Prefer direct presigned URL fields, then fallback to local path metadata.
+        for key in ("image_presigned_url", "image_url"):
+            value = str(capture.get(key, "") or "").strip()
+            if not value:
+                continue
+            scheme = urlparse(value).scheme.lower()
+            if scheme in {"http", "https"}:
+                return value
+        return ""
+
+    def _fetch_remote_image_bytes(self, url: str, capture_index: int = 0) -> Tuple[bytes, str]:
+        timeout_sec = max(1.0, float(self.image_remote_fetch_timeout_sec))
+        max_bytes = max(1024, int(self.image_remote_fetch_max_bytes))
+        req = Request(url, headers=self.image_request_headers)
+        try:
+            with urlopen(req, timeout=timeout_sec, context=self.image_ssl_context) as resp:
+                content_type = str(resp.headers.get("Content-Type", "") or "")
+                data = resp.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    logger.warning(
+                        "OCR image too large; skip inline embed (capture=%d, max_bytes=%d)",
+                        capture_index,
+                        max_bytes,
+                    )
+                    return b"", ""
+                self._log_image_debug(
+                    "Fetched OCR image URL: capture=%d bytes=%d content_type=%s url=%s",
+                    capture_index,
+                    len(data),
+                    content_type or "-",
+                    url,
+                )
+                return data, content_type
+        except HTTPError as exc:
+            body = read_http_error_body(exc)
+            hint = presigned_url_expiry_hint(url)
+            hint_tokens: List[str] = []
+            if hint.get("expired"):
+                hint_tokens.append("presigned_expired")
+            body_l = body.lower()
+            if "request has expired" in body_l or "expiredtoken" in body_l:
+                hint_tokens.append("expired_token")
+            if "signaturedoesnotmatch" in body_l:
+                hint_tokens.append("signature_mismatch")
+            if "accessdenied" in body_l:
+                hint_tokens.append("access_denied")
+            hint_text = ",".join(dict.fromkeys(hint_tokens))
+            logger.warning(
+                "Cannot fetch OCR image URL (capture=%d, status=%d, hint=%s, expires_at=%s, remain_sec=%s): %s",
+                capture_index,
+                int(exc.code),
+                hint_text or "-",
+                str(hint.get("expires_at", "-")),
+                str(hint.get("seconds_remaining", "-")),
+                body or str(exc),
+            )
+            return b"", ""
+        except Exception as exc:
+            err = str(exc)
+            if self.image_ssl_verify and "CERTIFICATE_VERIFY_FAILED" in err:
+                logger.warning(
+                    "Cannot fetch OCR image URL due to SSL verify (capture=%d): %s; "
+                    "set OCR_IMAGE_CA_BUNDLE/OCR_IMAGE_CA_PATH or OCR_IMAGE_SSL_VERIFY=0",
+                    capture_index,
+                    exc,
+                )
+                return b"", ""
+            logger.warning(
+                "Cannot fetch OCR image URL (capture=%d): %s",
+                capture_index,
+                exc,
+            )
+            return b"", ""
+
+    def _image_bytes_to_data_url(self, content: bytes, content_type: str = "") -> str:
+        if not content:
+            return ""
+        mime = str(content_type or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        b64 = base64.b64encode(content).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    def _guess_image_content_type_from_path(self, image_path: Path) -> str:
+        suffix = image_path.suffix.lower()
+        if suffix == ".png":
+            return "image/png"
+        if suffix == ".webp":
+            return "image/webp"
+        if suffix == ".gif":
+            return "image/gif"
+        return "image/jpeg"
+
     def _resolve_image_path(self, image_path: str) -> Optional[Path]:
         if not image_path:
+            self._log_image_debug("Local image path missing: empty_path")
             return None
         p = Path(image_path)
         if p.exists():
@@ -4089,39 +4652,8 @@ class AssembleAgent:
             alt = Path.cwd() / p
             if alt.exists():
                 return alt
+        self._log_image_debug("Local image path not found: %s", image_path)
         return None
-
-
-# =========================
-# LangGraph State
-# =========================
-class MeetingState(TypedDict, total=False):
-    attendees_text: str
-    agenda_text: str
-    transcript_json: Dict[str, Any]
-    transcript_index: Dict[int, str]
-    ocr_results_json: Dict[str, Any]
-    ocr_captures: List[Dict[str, Any]]
-    ocr_augmented_count: int
-    ocr_truncated_capture_count: int
-    ocr_truncated_chars_total: int
-
-    parsed_agenda: Dict[str, Any]
-    kg: Dict[str, Any]
-    actions: List[Dict[str, Any]]
-    decisions: List[Dict[str, Any]]
-
-    agenda_sections: List[str]
-    agenda_image_count: int
-    kg_image_links_count: int
-    final_html: str
-
-    react_loop: int
-    react_max_loops: int
-    react_needs_revision: bool
-    react_reports: List[Dict[str, Any]]
-    react_checklist_map: Dict[int, List[str]]
-    official_rewritten_count: int
 
 
 def build_workflow() -> Any:

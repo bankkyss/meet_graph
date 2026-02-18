@@ -17,41 +17,39 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: ailprsvai02 # ระบุ node ที่มี L40S GPU
       containers:
-      - name: vllm-server
-        image: vllm/vllm-openai:latest # หรือระบุเวอร์ชัน เช่น v0.7.0
-        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]  
-        args:
-          - "--model"
-          - "typhoon-ai/typhoon2.5-qwen3-30b-a3b"
-          - "--quantization"
-          - "bitsandbytes"
-          - "--load-format"
-          - "bitsandbytes"
-          - "--dtype"
-          - "bfloat16"
-          - "--kv-cache-dtype"
-          - "auto"
-          - "--gpu-memory-utilization"
-          - "0.80"
-          - "--max-model-len"
-          - "8192"
-          - "--max-num-seqs"
-          - "4"
-          - "--max-num-batched-tokens"
-          - "1024"
+      - name: ollama-server
+        image: ollama/ollama:latest
+        command: ["/bin/sh", "-c", "ollama serve"]
         env:
-          - name: PYTORCH_CUDA_ALLOC_CONF
-            value: "expandable_segments:True"
-          - name: HUGGING_FACE_HUB_TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: hf-token
-                key: token
+          - name: OLLAMA_MODELS
+            value: "/root/.ollama"
+          - name: OLLAMA_KEEP_ALIVE
+            value: "-1"
+          - name: OLLAMA_NUM_PARALLEL
+            value: "1"
+          - name: OLLAMA_MAX_LOADED_MODELS
+            value: "1"
+          - name: OLLAMA_CONTEXT_LENGTH
+            value: "32768"
         ports:
-        - containerPort: 8000
+        - containerPort: 11434
+        lifecycle:
+          postStart:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  until ollama list >/dev/null 2>&1; do sleep 2; done
+                  ollama pull scb10x/typhoon2.5-qwen3-30b-a3b:latest || true
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+          limits:
+            nvidia.com/gpu: "1"
         volumeMounts:
         - name: model-cache
-          mountPath: /root/.cache/huggingface
+          mountPath: /root/.ollama
       volumes:
       - name: model-cache
         persistentVolumeClaim:
@@ -66,7 +64,7 @@ spec:
     app: typhoon-vllm
   ports:
   - port: 80
-    targetPort: 8000
+    targetPort: 11434
   type: NodePort
 ---
 apiVersion: v1
