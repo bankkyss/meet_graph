@@ -3486,16 +3486,26 @@ SECTION เดิม:
                         off_scope,
                         len(missing),
                     )
-                    current = await self._rewrite_for_compliance(
-                        ag,
-                        current,
-                        checklist,
-                        agenda_data,
-                        evidence_text,
-                        coverage,
-                        missing,
-                        off_scope,
-                    )
+                    try:
+                        current = await self._rewrite_for_compliance(
+                            ag,
+                            current,
+                            checklist,
+                            agenda_data,
+                            evidence_text,
+                            coverage,
+                            missing,
+                            off_scope,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Compliance rewrite %d/%d round=%d failed; keep current section: %s",
+                            i + 1,
+                            len(agendas),
+                            round_i + 1,
+                            exc,
+                        )
+                        break
                 return i, self.helper._clean_html(current)
 
         tasks = []
@@ -3840,15 +3850,24 @@ class ReActReviseAgent:
                     float(report.get("scope", {}).get("off_scope_ratio", 0.0)),
                     str(report.get("structure", {}).get("reason", "n/a")),
                 )
-                revised = await self.react._revise_once(
-                    ag,
-                    section_html,
-                    agenda_data,
-                    checklist,
-                    evidence_text,
-                    report,
-                )
-                return i, self.react.gen_helper._clean_html(revised)
+                try:
+                    revised = await self.react._revise_once(
+                        ag,
+                        section_html,
+                        agenda_data,
+                        checklist,
+                        evidence_text,
+                        report,
+                    )
+                    return i, self.react.gen_helper._clean_html(revised)
+                except Exception as exc:
+                    logger.warning(
+                        "ReAct revise node %d/%d failed; keep current section: %s",
+                        i + 1,
+                        len(agendas),
+                        exc,
+                    )
+                    return i, self.react.gen_helper._clean_html(section_html)
 
         revised = await asyncio.gather(
             *[
@@ -4175,16 +4194,25 @@ Output Format (ต้องมีครบ):
                 if ocr_lines:
                     evidence_lines = evidence_lines + ocr_lines
                 messages = self._build_messages(ag, sec, evidence_lines, references)
-                resp = await self.client.generate(
-                    messages,
-                    temperature=0.1,
-                    completion_tokens=max(1200, stage_completion_tokens("OFFICIAL_EDITOR_COMPLETION_TOKENS", self.completion_tokens)),
-                    auto_continue=True,
-                )
-                fragment = self._clean_fragment(resp)
-                if not fragment:
-                    fragment = self._clean_fragment(sec)
-                return i, fragment
+                try:
+                    resp = await self.client.generate(
+                        messages,
+                        temperature=0.1,
+                        completion_tokens=max(1200, stage_completion_tokens("OFFICIAL_EDITOR_COMPLETION_TOKENS", self.completion_tokens)),
+                        auto_continue=True,
+                    )
+                    fragment = self._clean_fragment(resp)
+                    if not fragment:
+                        fragment = self._clean_fragment(sec)
+                    return i, fragment
+                except Exception as exc:
+                    logger.warning(
+                        "Official editor rewrite %d/%d failed; keep current section: %s",
+                        i + 1,
+                        len(agendas),
+                        exc,
+                    )
+                    return i, self._clean_fragment(sec)
 
         rewritten = await asyncio.gather(
             *[

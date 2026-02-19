@@ -26,9 +26,11 @@ from services.meeting_workflow import (
     ComplianceAgent,
     ExtractorAgent,
     GeneratorAgent,
+    KnowledgeGraph,
     LinkerAgent,
     OcrAugmentAgent,
     OfficialEditorAgent,
+    sanitize_llm_html_fragment,
     ReActCriticAgent,
     ReActDecideAgent,
     ReActPrepareAgent,
@@ -507,7 +509,7 @@ class GeneratorAgentOllama(GeneratorAgent):
         self.embed_timeout_sec = max(2.0, float(os.getenv("OLLAMA_EMBED_TIMEOUT_SEC", "25")))
         self.embed_batch_size = max(1, int(os.getenv("OLLAMA_EMBED_BATCH_SIZE", "48")))
 
-        self.hybrid_topk = max(4, int(os.getenv("OLLAMA_HYBRID_TOPK", "42")))
+        self.hybrid_topk = max(4, int(os.getenv("OLLAMA_HYBRID_TOPK", "60")))
         self.hybrid_bm25_topk = max(4, int(os.getenv("OLLAMA_HYBRID_BM25_TOPK", "120")))
         self.hybrid_lexical_topk = max(4, int(os.getenv("OLLAMA_HYBRID_LEXICAL_TOPK", "80")))
 
@@ -516,7 +518,7 @@ class GeneratorAgentOllama(GeneratorAgent):
         self.hybrid_w_lexical = max(0.0, float(os.getenv("OLLAMA_HYBRID_LEXICAL_WEIGHT", "0.15")))
         self.hybrid_min_score = max(0.0, float(os.getenv("OLLAMA_HYBRID_MIN_SCORE", "0.03")))
 
-        self.ocr_hybrid_topk = max(2, int(os.getenv("OLLAMA_OCR_HYBRID_TOPK", "14")))
+        self.ocr_hybrid_topk = max(2, int(os.getenv("OLLAMA_OCR_HYBRID_TOPK", "20")))
         self.ocr_hybrid_min_score = max(0.0, float(os.getenv("OLLAMA_OCR_HYBRID_MIN_SCORE", "0.03")))
 
         self.bm25_k1 = max(0.1, float(os.getenv("OLLAMA_BM25_K1", "1.5")))
@@ -1042,6 +1044,140 @@ class ReActReflexionAgentOllama(ReActReflexionAgent):
         self.gen_helper = GeneratorAgentOllama(client)
         self.validator = SectionValidationAgentOllama(client)
         self.compliance = ComplianceAgentOllama(client)
+        self.completeness_enabled = env_flag("REACT_COMPLETENESS_CHECK_ENABLED", True)
+        self.max_missing_numbers = max(0, int(os.getenv("REACT_MAX_MISSING_NUMBERS", "6")))
+        self.max_missing_named_terms = max(0, int(os.getenv("REACT_MAX_MISSING_NAMED_TERMS", "10")))
+        self.max_missing_ratio = max(0.0, min(1.0, float(os.getenv("REACT_MAX_MISSING_RATIO", "0.65"))))
+        self.max_number_candidates = max(6, int(os.getenv("REACT_COMPLETENESS_MAX_NUMBER_CANDIDATES", "28")))
+        self.max_named_candidates = max(8, int(os.getenv("REACT_COMPLETENESS_MAX_NAMED_CANDIDATES", "40")))
+        self.named_term_stopwords = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "this",
+            "that",
+            "ocr",
+            "score",
+            "kw",
+            "evidence",
+            "source",
+            "citation",
+            "unknown",
+        }
+
+    def _plain_text(self, value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", str(value or ""))
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _norm(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        text = re.sub(r"[“”\"'`]", "", text)
+        return text
+
+    def _extract_number_candidates(self, text: str) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for m in re.finditer(r"\b\d[\d,]*(?:\.\d+)?%?\b", text):
+            token = str(m.group(0) or "").strip().rstrip(".,")
+            if not token:
+                continue
+            if len(token) < 2 and not token.endswith("%"):
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+            if len(out) >= self.max_number_candidates:
+                break
+        return out
+
+    def _extract_named_candidates(self, text: str) -> List[str]:
+        out: List[str] = []
+        seen = set()
+
+        for m in re.finditer(
+            r"(?:นาย|นางสาว|นาง|คุณ)\s*[A-Za-zก-๙]{2,40}(?:\s+[A-Za-zก-๙]{2,40})?",
+            text,
+        ):
+            token = re.sub(r"\s+", " ", str(m.group(0) or "")).strip()
+            key = self._norm(token)
+            if not token or key in seen:
+                continue
+            seen.add(key)
+            out.append(token)
+            if len(out) >= self.max_named_candidates:
+                return out
+
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_./-]{1,}\b", text):
+            raw = str(token or "").strip()
+            if not raw:
+                continue
+            low = raw.lower()
+            if low in self.named_term_stopwords:
+                continue
+            if re.fullmatch(r"(?:part\d+_)?speaker_\d+", low):
+                continue
+            if len(raw) < 3 and not raw.isupper():
+                continue
+            key = self._norm(raw)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(raw)
+            if len(out) >= self.max_named_candidates:
+                break
+
+        return out
+
+    def _tool_check_completeness(self, section_html: str, evidence_text: str) -> Dict[str, Any]:
+        if not self.completeness_enabled:
+            return {
+                "enabled": False,
+                "pass": True,
+                "candidate_numbers": 0,
+                "candidate_named_terms": 0,
+                "missing_numbers_count": 0,
+                "missing_named_terms_count": 0,
+                "missing_ratio": 0.0,
+                "missing_numbers": [],
+                "missing_named_terms": [],
+            }
+
+        section_plain = self._plain_text(section_html)
+        section_norm = self._norm(section_plain)
+        evidence_plain = self._plain_text(evidence_text)
+        evidence_plain = re.sub(r"\[\s*#\d+\s*\]", " ", evidence_plain)
+
+        numbers = self._extract_number_candidates(evidence_plain)
+        names = self._extract_named_candidates(evidence_plain)
+
+        missing_numbers = [x for x in numbers if x not in section_plain]
+        missing_names = [x for x in names if self._norm(x) not in section_norm]
+
+        candidate_total = len(numbers) + len(names)
+        missing_total = len(missing_numbers) + len(missing_names)
+        missing_ratio = (float(missing_total) / float(candidate_total)) if candidate_total > 0 else 0.0
+
+        pass_check = (
+            len(missing_numbers) <= self.max_missing_numbers
+            and len(missing_names) <= self.max_missing_named_terms
+            and missing_ratio <= self.max_missing_ratio
+        )
+
+        return {
+            "enabled": True,
+            "pass": pass_check,
+            "candidate_numbers": len(numbers),
+            "candidate_named_terms": len(names),
+            "missing_numbers_count": len(missing_numbers),
+            "missing_named_terms_count": len(missing_names),
+            "missing_ratio": missing_ratio,
+            "missing_numbers": missing_numbers[:10],
+            "missing_named_terms": missing_names[:12],
+        }
 
 
 class ReActPrepareAgentOllama(ReActPrepareAgent):
@@ -1053,11 +1189,231 @@ class ReActCriticAgentOllama(ReActCriticAgent):
     def __init__(self, client: TyphoonClient):
         self.react = ReActReflexionAgentOllama(client)
 
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
+        agendas = parsed.agendas
+        sections = state.get("agenda_sections") or []
+        checklist_map = state.get("react_checklist_map") or self.react.compliance._extract_checklists(
+            state.get("agenda_text", ""), agendas
+        )
+
+        kg = KnowledgeGraph()
+        kg.nodes = (state.get("kg") or {}).get("nodes", {})
+        kg.edges = (state.get("kg") or {}).get("edges", [])
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+        transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
+
+        reports: List[Dict[str, Any]] = []
+        needs_revision = False
+
+        for i, ag in enumerate(agendas):
+            section_html = sections[i] if i < len(sections) else ""
+            no = self.react.compliance._agenda_no(ag.title, i + 1)
+            checklist = checklist_map.get(no, [])[: self.react.compliance.max_items]
+
+            structure = self.react._tool_check_structure(section_html)
+            scope = self.react._tool_check_scope(ag, section_html, checklist)
+
+            agenda_data = kg.query_agenda(ag.title)
+            ids = self.react.gen_helper._collect_evidence_ids(ag, agenda_data, transcript_index)
+            evidence_text = self.react.gen_helper._build_evidence_text(transcript_index, ids)
+            ocr_lines = self.react.gen_helper._collect_ocr_evidence_lines(ag, ocr_captures)
+            if ocr_lines:
+                evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
+            completeness = self.react._tool_check_completeness(section_html, evidence_text)
+
+            pass_all = (
+                (not structure["needs_rewrite"])
+                and scope["coverage"] >= self.react.target_coverage
+                and scope["off_scope_ratio"] <= self.react.max_offscope_ratio
+                and completeness.get("pass", True)
+            )
+            if not pass_all:
+                needs_revision = True
+            if completeness.get("enabled") and not completeness.get("pass", True):
+                logger.info(
+                    "ReAct completeness miss %d/%d coverage=%.2f off_scope=%.2f miss_num=%d miss_named=%d ratio=%.2f",
+                    i + 1,
+                    len(agendas),
+                    scope["coverage"],
+                    scope["off_scope_ratio"],
+                    int(completeness.get("missing_numbers_count", 0)),
+                    int(completeness.get("missing_named_terms_count", 0)),
+                    float(completeness.get("missing_ratio", 0.0)),
+                )
+
+            reports.append(
+                {
+                    "index": i,
+                    "agenda_title": ag.title,
+                    "checklist": checklist,
+                    "pass_all": pass_all,
+                    "structure": structure,
+                    "scope": scope,
+                    "completeness": completeness,
+                    "targets": {
+                        "coverage": self.react.target_coverage,
+                        "max_off_scope_ratio": self.react.max_offscope_ratio,
+                    },
+                }
+            )
+
+        state["react_reports"] = reports
+        state["react_needs_revision"] = needs_revision
+        return state
+
 
 class ReActReviseAgentOllama(ReActReviseAgent):
     def __init__(self, client: TyphoonClient):
         self.react = ReActReflexionAgentOllama(client)
         self.max_parallel = self.react.max_parallel
+
+
+class TableFormatterAgentOllama:
+    """
+    Final formatting node:
+    - keep facts but reshape section into formal table-oriented HTML
+    - runs after official_editor and before assemble
+    """
+
+    def __init__(self, client: TyphoonClient):
+        self.client = client
+        self.enabled = env_flag("TABLE_FORMATTER_ENABLED", True)
+        self.max_parallel = max(1, int(os.getenv("TABLE_FORMATTER_MAX_PARALLEL", "2")))
+        self.temperature = max(0.0, min(0.3, float(os.getenv("TABLE_FORMATTER_TEMPERATURE", "0.05"))))
+        self.completion_tokens = max(
+            1000,
+            stage_completion_tokens("TABLE_FORMATTER_COMPLETION_TOKENS", 3200),
+        )
+
+    def _build_messages(self, agenda_title: str, agenda_details: List[str], draft_section_html: str) -> List[Dict[str, str]]:
+        details_text = "\n".join(f"- {x}" for x in (agenda_details or [])) or "- ไม่มีรายละเอียดวาระย่อย"
+        system_prompt = """คุณคือผู้เชี่ยวชาญการจัดทำรายงานการประชุมแบบตารางทางการ
+หน้าที่คือจัดรูปแบบใหม่เท่านั้น ห้ามคิดข้อเท็จจริงใหม่
+
+กฎ:
+- ห้ามใช้หัวข้อเดิมแบบ "ประเด็นหารือ", "มติที่ประชุม", "Action Plan"
+- ต้องคงชื่อบุคคล ชื่อโครงการ หน่วยงาน ตัวเลข วันที่ และเปอร์เซ็นต์ให้ครบที่สุด
+- ถ้าไม่มีผู้รับผิดชอบชัดเจน ให้ใส่ "ผู้เกี่ยวข้อง"
+- ถ้าไม่มีสถานะชัดเจน ให้ใส่ "-"
+- ตอบเป็น HTML fragment เท่านั้น
+"""
+        user_prompt = f"""จัดรูปแบบรายงานวาระนี้ใหม่ให้อยู่ในรูปแบบตารางอย่างเป็นทางการ
+
+วาระ:
+{agenda_title}
+
+รายละเอียดวาระ:
+{details_text}
+
+เนื้อหาต้นฉบับ:
+{draft_section_html}
+
+รูปแบบบังคับ:
+<h4>สรุปภาพรวมวาระ</h4>
+<p>สรุปย่อ 1-2 ย่อหน้า</p>
+<table>
+  <tr>
+    <th>งาน/ประเด็น</th>
+    <th>ผู้รับผิดชอบ</th>
+    <th>สถานะ/หมายเหตุ</th>
+  </tr>
+  <tr>
+    <td>...</td>
+    <td>...</td>
+    <td>...</td>
+  </tr>
+</table>
+
+ข้อบังคับ:
+- ต้องมี <table> อย่างน้อย 1 ตาราง
+- ห้าม Markdown
+- ห้ามใส่ citation เช่น [#123] หรือ Evidence [#123]
+"""
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _clean(self, text: str) -> str:
+        cleaned = sanitize_llm_html_fragment(text)
+        cleaned = re.sub(
+            r"<h4[^>]*>\s*(?:ประเด็นหารือ|มติที่ประชุม|การดำเนินการ(?:\s*\(.*?\))?|action\s*items?)\s*</h4>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        if not self.enabled:
+            state["table_formatter_rewritten_count"] = 0
+            return state
+
+        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
+        agendas = parsed.agendas
+        sections = state.get("agenda_sections") or []
+        if not agendas or not sections:
+            state["table_formatter_rewritten_count"] = 0
+            return state
+
+        sem = asyncio.Semaphore(self.max_parallel)
+
+        async def rewrite_one(i: int, ag: Any, sec: str) -> Tuple[int, str, bool]:
+            async with sem:
+                original = self._clean(sec)
+                messages = self._build_messages(ag.title, list(ag.details or []), original)
+                try:
+                    resp = await self.client.generate(
+                        messages,
+                        temperature=self.temperature,
+                        completion_tokens=self.completion_tokens,
+                        auto_continue=True,
+                    )
+                    candidate = self._clean(resp)
+                    if "<table" not in candidate.lower():
+                        retry_messages = list(messages) + [
+                            {
+                                "role": "user",
+                                "content": "คำตอบก่อนหน้าไม่ผ่าน: ต้องมีตาราง HTML อย่างน้อย 1 ตาราง ตอบใหม่ทั้งหมด",
+                            }
+                        ]
+                        retry = await self.client.generate(
+                            retry_messages,
+                            temperature=self.temperature,
+                            completion_tokens=self.completion_tokens,
+                            auto_continue=True,
+                        )
+                        retry_clean = self._clean(retry)
+                        if "<table" in retry_clean.lower():
+                            candidate = retry_clean
+                    if not candidate:
+                        return i, original, False
+                    if "<table" not in candidate.lower():
+                        return i, original, False
+                    return i, candidate, True
+                except Exception as exc:
+                    logger.warning(
+                        "Table formatter rewrite %d/%d failed; keep current section: %s",
+                        i + 1,
+                        len(agendas),
+                        exc,
+                    )
+                    return i, original, False
+
+        rewritten = await asyncio.gather(
+            *[
+                rewrite_one(i, ag, sections[i] if i < len(sections) else "")
+                for i, ag in enumerate(agendas)
+            ]
+        )
+        state["agenda_sections"] = [html for _, html, _ in sorted(rewritten, key=lambda x: x[0])]
+        rewritten_count = sum(1 for _, _, ok in rewritten if ok)
+        state["table_formatter_rewritten_count"] = rewritten_count
+        logger.info("Table formatter rewritten sections: %d", rewritten_count)
+        return state
 
 
 def build_workflow() -> Any:
@@ -1071,6 +1427,7 @@ def build_workflow() -> Any:
     graph.add_node("generate_sections", GeneratorAgentOllama(client))
     graph.add_node("validate_sections", SectionValidationAgentOllama(client))
     graph.add_node("compliance_sections", ComplianceAgentOllama(client))
+    graph.add_node("table_formatter", TableFormatterAgentOllama(client))
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
@@ -1080,7 +1437,8 @@ def build_workflow() -> Any:
     graph.add_edge("link_events", "generate_sections")
     graph.add_edge("generate_sections", "validate_sections")
     graph.add_edge("validate_sections", "compliance_sections")
-    graph.add_edge("compliance_sections", "assemble")
+    graph.add_edge("compliance_sections", "table_formatter")
+    graph.add_edge("table_formatter", "assemble")
     graph.add_edge("assemble", END)
 
     return graph.compile()
@@ -1102,6 +1460,7 @@ def build_workflow_react() -> Any:
     graph.add_node("react_decide", ReActDecideAgent())
     graph.add_node("react_revise", ReActReviseAgentOllama(client))
     graph.add_node("official_editor", OfficialEditorAgent(client))
+    graph.add_node("table_formatter", TableFormatterAgentOllama(client))
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
@@ -1123,7 +1482,8 @@ def build_workflow_react() -> Any:
         },
     )
     graph.add_edge("react_revise", "react_critic")
-    graph.add_edge("official_editor", "assemble")
+    graph.add_edge("official_editor", "table_formatter")
+    graph.add_edge("table_formatter", "assemble")
     graph.add_edge("assemble", END)
 
     return graph.compile()

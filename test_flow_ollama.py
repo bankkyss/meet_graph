@@ -658,6 +658,7 @@ def run_react_workflow(
             ReActDecideAgent,
             ReActReviseAgentOllama,
             OfficialEditorAgent,
+            TableFormatterAgentOllama,
             AssembleAgent,
         )
     except Exception as e:
@@ -734,6 +735,7 @@ def run_react_workflow(
         react_decide = ReActDecideAgent()
         react_revise = ReActReviseAgentOllama(client)
         official_editor = OfficialEditorAgent(client)
+        table_formatter = TableFormatterAgentOllama(client)
         assemble = AssembleAgent()
 
         state = await _call_node("parse_agenda", parse_agenda, state)
@@ -766,6 +768,7 @@ def run_react_workflow(
                 break
 
         state = await _call_node("official_editor", official_editor, state)
+        state = await _call_node("table_formatter", table_formatter, state)
         state = await _call_node("assemble", assemble, state)
         return state
 
@@ -920,6 +923,7 @@ def main() -> None:
         return
 
     workflow_official_rewritten_count = int(out_state.get("official_rewritten_count", 0) or 0)
+    workflow_table_formatter_count = int(out_state.get("table_formatter_rewritten_count", 0) or 0)
     extra_rewritten_count = 0
     run_extra_editor = (
         not args.skip_official_editor
@@ -989,6 +993,7 @@ def main() -> None:
     print(f"Frames folder: {frames_dir}")
     print(f"Agenda count: {len(parsed.agendas)}")
     print(f"Officially rewritten sections (workflow): {workflow_official_rewritten_count}")
+    print(f"Table-formatted sections (workflow): {workflow_table_formatter_count}")
     print(f"Officially rewritten sections (extra local pass): {extra_rewritten_count}")
     print(f"Extracted frames: {len(frame_files)}")
     print(f"Injected images in HTML: {injected_count}")
