@@ -38,7 +38,11 @@ from services.meeting_workflow import (
     agenda_match_token_bag,
     capture_text_for_match,
     ParsedAgenda,
+    env_flag,
+    env_int,
     safe_int,
+    stage_completion_tokens,
+    is_probably_incomplete_html_fragment,
     try_parse_json,
     route_react_decision,
 )
@@ -54,7 +58,7 @@ class TyphoonClient:
 
     def __init__(self):
         self.model = os.getenv("OLLAMA_MODEL", "scb10x/typhoon2.5-qwen3-30b-a3b:latest")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.60.27:11434")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://172.20.12.7:31319")#"http://192.168.60.27:11434")
         self.max_retries = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
         self.base_backoff = float(os.getenv("OLLAMA_BACKOFF_SEC", "1.0"))
         self.request_timeout_sec = max(5.0, float(os.getenv("OLLAMA_REQUEST_TIMEOUT_SEC", "240")))
@@ -101,7 +105,58 @@ class TyphoonClient:
         messages: List[Dict[str, Any]],
         temperature: float = 0.2,
         completion_tokens: int = 800,
+        json_mode: bool = False,
+        auto_continue: bool = False,
+        continue_rounds: Optional[int] = None,
+        top_p: float = 0.6,
     ) -> str:
+        if auto_continue and not json_mode and env_flag("LLM_AUTO_CONTINUE_ENABLED", True):
+            rounds = int(continue_rounds if continue_rounds is not None else env_int("LLM_AUTO_CONTINUE_MAX_ROUNDS", 2))
+            rounds = max(1, rounds)
+            text = await self.generate(
+                messages,
+                temperature=temperature,
+                completion_tokens=completion_tokens,
+                json_mode=json_mode,
+                auto_continue=False,
+                top_p=top_p,
+            )
+            if not is_probably_incomplete_html_fragment(text):
+                return text
+            logger.warning("Ollama output seems truncated; auto-continue up to %d rounds", rounds)
+            combined = str(text or "")
+            for _ in range(rounds):
+                assistant_tail = combined[-20000:]
+                follow_messages = list(messages) + [
+                    {"role": "assistant", "content": assistant_tail},
+                    {
+                        "role": "user",
+                        "content": (
+                            "คำตอบก่อนหน้าถูกตัดกลางทาง ให้ตอบต่อจากจุดเดิมทันที "
+                            "ห้ามเริ่มใหม่ ห้ามอธิบายเพิ่ม ห้ามทำซ้ำช่วงเดิม "
+                            "และตอบเป็น HTML fragment ต่อเนื่องเท่านั้น"
+                        ),
+                    },
+                ]
+                extra = await self.generate(
+                    follow_messages,
+                    temperature=temperature,
+                    completion_tokens=completion_tokens,
+                    json_mode=False,
+                    auto_continue=False,
+                    top_p=top_p,
+                )
+                extra = str(extra or "").strip()
+                if not extra:
+                    break
+                merged = (combined.rstrip() + "\n" + extra).strip()
+                if merged == combined:
+                    break
+                combined = merged
+                if not is_probably_incomplete_html_fragment(combined):
+                    break
+            return combined
+
         lc_messages = self._to_langchain_messages(messages)
         options = {
             "temperature": float(max(0.0, temperature)),
@@ -109,18 +164,21 @@ class TyphoonClient:
         }
         if self.stop_sequences:
             options["stop"] = self.stop_sequences
+        invoke_kwargs: Dict[str, Any] = {"options": options}
+        if json_mode:
+            invoke_kwargs["format"] = "json"
 
         last_err: Exception | None = None
         for attempt in range(1, max(1, self.max_retries) + 1):
             try:
                 if hasattr(self.client, "ainvoke"):
                     resp = await asyncio.wait_for(
-                        self.client.ainvoke(lc_messages, options=options),
+                        self.client.ainvoke(lc_messages, **invoke_kwargs),
                         timeout=self.request_timeout_sec,
                     )
                 else:
                     resp = await asyncio.wait_for(
-                        asyncio.to_thread(self.client.invoke, lc_messages, options=options),
+                        asyncio.to_thread(self.client.invoke, lc_messages, **invoke_kwargs),
                         timeout=self.request_timeout_sec,
                     )
                 return self._content_to_text(getattr(resp, "content", resp)).strip()
@@ -179,11 +237,15 @@ Output JSON:
 - ห้ามใส่ Markdown
 """},
         ]
-        resp = await self.client.generate(messages, temperature=0.0, completion_tokens=1400)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("AGENDA_PARSE_COMPLETION_TOKENS", 1400),
+        )
         logger.info(
-            "Raw AgendaParserAgent(Ollama) response (chars=%d): %s",
+            "Raw AgendaParserAgent(Ollama) response (chars=%d)",
             len(resp or ""),
-            (resp or "")[:1200],
+            # (resp or "")[:1200],
         )
         data = try_parse_json(resp)
         if not data:
@@ -357,11 +419,19 @@ class ExtractorAgentOllama(ExtractorAgent):
 
     def __init__(self, client: TyphoonClient):
         super().__init__(client)
+        default_extract_tokens = stage_completion_tokens("EXTRACT_CHUNK_COMPLETION_TOKENS", 1800)
         self.extract_completion_tokens = max(
-            300, int(os.getenv("OLLAMA_EXTRACT_COMPLETION_TOKENS", "1400"))
+            300, int(os.getenv("OLLAMA_EXTRACT_COMPLETION_TOKENS", str(default_extract_tokens)))
         )
 
-    async def _extract_chunk(self, chunk_text: str, agenda_context: str) -> Dict[str, Any]:
+    async def _extract_chunk(
+        self,
+        chunk_text: str,
+        agenda_context: str,
+        *,
+        chunk_label: str = "",
+        log_parse_warning: bool = True,
+    ) -> Dict[str, Any]:
         started = time.monotonic()
         messages = [
             {"role": "system", "content": self.system_prompt},
@@ -372,10 +442,11 @@ class ExtractorAgentOllama(ExtractorAgent):
                 messages,
                 temperature=0.2,
                 completion_tokens=self.extract_completion_tokens,
+                json_mode=True,
             )
         except Exception as exc:
             logger.warning("Extract chunk failed: %s", exc)
-            return {"speakers": [], "topics": [], "actions": [], "decisions": []}
+            return self._empty_extract_result()
 
         data = try_parse_json(resp)
         if not data:
@@ -385,12 +456,24 @@ class ExtractorAgentOllama(ExtractorAgent):
                 logger.warning("Extract chunk repair failed: %s", exc)
                 data = None
         if not data:
-            logger.warning("Extract chunk returned invalid JSON; fallback empty result")
-            return {"speakers": [], "topics": [], "actions": [], "decisions": []}
+            if log_parse_warning:
+                raw_preview = str(resp or "")
+                max_chars = max(200, int(os.getenv("EXTRACT_LOG_JSON_MAX_CHARS", "4000")))
+                if len(raw_preview) > max_chars:
+                    raw_preview = raw_preview[:max_chars] + "...(truncated)"
+                # if raw_preview.strip():
+                #     logger.warning("Extract raw response (non-JSON) chunk=%s: %s", chunk_label or "-", raw_preview)
+                logger.warning("Extract chunk returned invalid JSON; try split-retry (chunk=%s)", chunk_label or "-")
+            return self._empty_extract_result(parse_failed=True)
 
         for k in ("speakers", "topics", "actions", "decisions"):
             if k not in data or not isinstance(data[k], list):
                 data[k] = []
+        parsed_json = json.dumps(data, ensure_ascii=False)
+        max_chars = max(200, int(os.getenv("EXTRACT_LOG_JSON_MAX_CHARS", "4000")))
+        if len(parsed_json) > max_chars:
+            parsed_json = parsed_json[:max_chars] + "...(truncated)"
+        # logger.info("Extract chunk response JSON (chunk=%s): %s", chunk_label or "-", parsed_json)
         elapsed = time.monotonic() - started
         logger.info(
             "Extract chunk parsed (speakers=%d topics=%d actions=%d decisions=%d elapsed=%.1fs)",

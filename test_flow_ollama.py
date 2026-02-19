@@ -21,6 +21,7 @@ import asyncio
 import base64
 import concurrent.futures
 import html
+import inspect
 import json
 import logging
 import os
@@ -133,6 +134,18 @@ def clean_html_fragment(text: str) -> str:
     bleed = re.search(r"(?is)\bwrite a short story\b", text)
     if bleed:
         text = text[: bleed.start()]
+    text = re.sub(
+        r"(?i)\bข้อความใน\s*(?:evidence|source|citation)\s*\[\s*#?\d+\s*\]",
+        "ข้อความหลักฐาน",
+        text,
+    )
+    text = re.sub(r"(?i)\b(?:evidence|source|citation)\s*\[\s*#?\d+\s*\]", "หลักฐาน", text)
+    text = re.sub(r"(?i)\b(?:evidence|source|citation)\s*#\d+\b", "หลักฐาน", text)
+    text = re.sub(r"\[\s*#\d+\s*\]", "", text)
+    text = re.sub(r"\(\s*#\d+\s*\)", "", text)
+    text = re.sub(r"หลักฐาน\s+ที่", "หลักฐานที่", text)
+    text = re.sub(r"\s+และ\s*(</[a-zA-Z0-9]+>)", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     if "<body" in text.lower():
         m = re.search(r"<body[^>]*>(.*?)</body>", text, flags=re.IGNORECASE | re.DOTALL)
         if m:
@@ -475,6 +488,7 @@ def build_editor_messages(
 - ใช้ภาษาเขียนทางการ ห้ามภาษาพูด เช่น ครับ/ค่ะ/เอ่อ/อ่า
 - รักษาข้อเท็จจริง ชื่อบุคคล ชื่อหน่วยงาน ชื่อโครงการ และตัวเลขให้ตรงข้อมูล
 - หากข้อมูลไม่ชัดเจน ให้ระบุว่า "ไม่มีข้อมูลชัดเจน" ห้ามเดา
+- ห้ามใส่ citation หรือรหัสหลักฐาน เช่น [#123], Evidence [#123], Source [#123]
 - ห้ามแสดงกระบวนการคิด และห้ามใช้ Markdown
 - ตอบเป็น HTML fragment เท่านั้น
 """
@@ -521,6 +535,7 @@ Output Format (ต้องมีครบ):
 - ทุกหัวข้อใน "ประเด็นหารือ" ควรมีรายละเอียดอย่างน้อย 1-2 ประโยค
 - ถ้ามีตัวเลข ให้คงค่าตัวเลขตามหลักฐาน
 - หากไม่พบข้อมูลมติหรือ Action ให้ระบุ "ไม่มีข้อมูลชัดเจน"
+- ห้ามแสดงรหัสอ้างอิงหลักฐาน เช่น [#123] หรือ Evidence [#123] ในรายงาน
 """
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
@@ -530,7 +545,7 @@ async def rewrite_sections_official_async(
     parsed: Any,
     transcript: Any,
     config: Dict[str, Any],
-    completion_tokens: int = 2400,
+    completion_tokens: int = 6400,
 ) -> Tuple[str, int]:
     from services.meeting_workflow_ollama import TyphoonClient
 
@@ -561,7 +576,12 @@ async def rewrite_sections_official_async(
             evidence_lines=evidence_lines,
             references=references,
         )
-        resp = await client.generate(messages, temperature=0.1, completion_tokens=completion_tokens)
+        resp = await client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=completion_tokens,
+            auto_continue=True,
+        )
         fragment = clean_html_fragment(resp)
         if not fragment:
             fragment = clean_html_fragment(body_html)
@@ -592,11 +612,12 @@ def run_react_workflow_with_progress(
     config: Dict[str, Any],
     transcript_raw: Dict[str, Any],
     ocr_results_raw: Optional[Dict[str, Any]] = None,
+    resume_kg_raw: Optional[Dict[str, Any]] = None,
     heartbeat_sec: int = 10,
 ) -> Tuple[str, Any, Any, Dict[str, Any]]:
     start_ts = time.time()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    fut = executor.submit(run_react_workflow, config, transcript_raw, ocr_results_raw)
+    fut = executor.submit(run_react_workflow, config, transcript_raw, ocr_results_raw, resume_kg_raw)
     try:
         while True:
             try:
@@ -615,14 +636,30 @@ def run_react_workflow(
     config: Dict[str, Any],
     transcript_raw: Dict[str, Any],
     ocr_results_raw: Optional[Dict[str, Any]] = None,
+    resume_kg_raw: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Any, Any, Dict[str, Any]]:
     try:
         from services.meeting_workflow import (
             ParsedAgenda,
             TranscriptJSON,
             build_transcript_index,
+            route_react_decision,
         )
-        from services.meeting_workflow_ollama import WORKFLOW_REACT
+        from services.meeting_workflow_ollama import (
+            WORKFLOW_REACT,
+            TyphoonClient,
+            AgendaParserAgentOllama,
+            OcrAugmentAgent,
+            GeneratorAgentOllama,
+            SectionValidationAgentOllama,
+            ComplianceAgentOllama,
+            ReActPrepareAgentOllama,
+            ReActCriticAgentOllama,
+            ReActDecideAgent,
+            ReActReviseAgentOllama,
+            OfficialEditorAgent,
+            AssembleAgent,
+        )
     except Exception as e:
         raise RuntimeError(
             f"Import workflow failed with interpreter: {sys.executable}\n"
@@ -639,6 +676,13 @@ def run_react_workflow(
     }
     if isinstance(ocr_results_raw, dict):
         init_state["ocr_results_json"] = ocr_results_raw
+
+    if resume_kg_raw is not None:
+        if not isinstance(resume_kg_raw, dict):
+            raise ValueError("resume_kg_raw must be an object")
+        if not isinstance(resume_kg_raw.get("nodes"), dict) or not isinstance(resume_kg_raw.get("edges"), list):
+            raise ValueError("resume_kg_raw must contain `nodes` (object) and `edges` (list)")
+        init_state["kg"] = resume_kg_raw
 
     async def _run_with_updates() -> Dict[str, Any]:
         merged: Dict[str, Any] = dict(init_state)
@@ -659,7 +703,77 @@ def run_react_workflow(
             return merged
         return await WORKFLOW_REACT.ainvoke(init_state)
 
-    out = asyncio.run(_run_with_updates())
+    async def _run_resume_from_kg() -> Dict[str, Any]:
+        state: Dict[str, Any] = dict(init_state)
+        step_no = 0
+
+        def _print_step(node_name: str, patch: Dict[str, Any]) -> None:
+            nonlocal step_no
+            step_no += 1
+            keys = list((patch or {}).keys())
+            key_preview = ", ".join(keys[:5]) + (", ..." if len(keys) > 5 else "")
+            print(f"[node] {step_no:02d} {node_name} done keys=[{key_preview}]", flush=True)
+
+        async def _call_node(node_name: str, node: Any, current_state: Dict[str, Any]) -> Dict[str, Any]:
+            result = node(current_state)
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, dict):
+                raise TypeError(f"{node_name} returned {type(result).__name__}, expected dict")
+            _print_step(node_name, result)
+            return result
+
+        client = TyphoonClient()
+        parse_agenda = AgendaParserAgentOllama(client)
+        augment_with_ocr = OcrAugmentAgent()
+        generate_sections = GeneratorAgentOllama(client)
+        validate_sections = SectionValidationAgentOllama(client)
+        compliance_sections = ComplianceAgentOllama(client)
+        react_prepare = ReActPrepareAgentOllama(client)
+        react_critic = ReActCriticAgentOllama(client)
+        react_decide = ReActDecideAgent()
+        react_revise = ReActReviseAgentOllama(client)
+        official_editor = OfficialEditorAgent(client)
+        assemble = AssembleAgent()
+
+        state = await _call_node("parse_agenda", parse_agenda, state)
+        state = await _call_node("augment_with_ocr", augment_with_ocr, state)
+
+        # Keep preloaded KG and skip extract_kg/link_events for faster rerun.
+        state["kg"] = resume_kg_raw
+        print(
+            f"[resume] using provided KG (nodes={len(resume_kg_raw.get('nodes', {}))}, edges={len(resume_kg_raw.get('edges', []))})",
+            flush=True,
+        )
+
+        state = await _call_node("generate_sections", generate_sections, state)
+        state = await _call_node("validate_sections", validate_sections, state)
+        state = await _call_node("compliance_sections", compliance_sections, state)
+        state = await _call_node("react_prepare", react_prepare, state)
+
+        guard = 0
+        while True:
+            state = await _call_node("react_critic", react_critic, state)
+            state = await _call_node("react_decide", react_decide, state)
+            route = route_react_decision(state)
+            print(f"[route] react_decide -> {route}", flush=True)
+            if route != "revise":
+                break
+            state = await _call_node("react_revise", react_revise, state)
+            guard += 1
+            if guard > max(4, int(state.get("react_max_loops", 2)) + 2):
+                print("[warn] react revise guard hit; continue to official_editor", flush=True)
+                break
+
+        state = await _call_node("official_editor", official_editor, state)
+        state = await _call_node("assemble", assemble, state)
+        return state
+
+    if resume_kg_raw is None:
+        out = asyncio.run(_run_with_updates())
+    else:
+        out = asyncio.run(_run_resume_from_kg())
+
     final_html = str(out.get("final_html", "") or "")
     parsed = ParsedAgenda.model_validate(out.get("parsed_agenda", {}))
     if not final_html:
@@ -680,9 +794,14 @@ def main() -> None:
         action="store_true",
         help="Force an extra local official-editor pass even though WORKFLOW_REACT already has official_editor node.",
     )
-    parser.add_argument("--editor-completion-tokens", type=int, default=2400)
+    parser.add_argument("--editor-completion-tokens", type=int, default=6400)
     parser.add_argument("--with-images", action="store_true", help="Attach video frames into HTML")
     parser.add_argument("--ocr-json", default="", help="Path to capture_ocr_results.json (optional)")
+    parser.add_argument(
+        "--resume-kg-json",
+        default="",
+        help="Path to kg_state.json to skip extract_kg/link_events and continue from generation stage.",
+    )
     parser.add_argument(
         "--min-ocr-text-len",
         type=int,
@@ -707,6 +826,7 @@ def main() -> None:
     transcript_path = Path(args.transcript)
     video_path = Path(args.video)
     ocr_path = Path(args.ocr_json) if str(args.ocr_json or "").strip() else None
+    resume_kg_path = Path(args.resume_kg_json) if str(args.resume_kg_json or "").strip() else None
     output_root = Path(args.output_dir)
 
     if args.with_images and not video_path.exists():
@@ -715,6 +835,7 @@ def main() -> None:
     config = load_json(config_path)
     transcript_raw = load_json(transcript_path)
     ocr_raw: Optional[Dict[str, Any]] = None
+    resume_kg_raw: Optional[Dict[str, Any]] = None
     if ocr_path is not None:
         ocr_raw = load_json(ocr_path)
         if not isinstance(ocr_raw, dict):
@@ -734,6 +855,16 @@ def main() -> None:
                     "[warn] --ocr-json has no `captures`; OCR image matching may return zero images.",
                     flush=True,
                 )
+    if resume_kg_path is not None:
+        resume_kg_raw = load_json(resume_kg_path)
+        if not isinstance(resume_kg_raw, dict):
+            raise ValueError("KG JSON must be an object")
+        if not isinstance(resume_kg_raw.get("nodes"), dict) or not isinstance(resume_kg_raw.get("edges"), list):
+            raise ValueError("KG JSON must contain `nodes` (object) and `edges` (list)")
+        print(
+            f"[resume] loaded KG JSON nodes={len(resume_kg_raw.get('nodes', {}))} edges={len(resume_kg_raw.get('edges', []))}",
+            flush=True,
+        )
     if not str(config.get("MEETING_INFO", "")).strip() or not str(config.get("AGENDA_TEXT", "")).strip():
         raise ValueError("Config must contain MEETING_INFO and AGENDA_TEXT")
 
@@ -782,6 +913,7 @@ def main() -> None:
             config=config,
             transcript_raw=transcript_raw,
             ocr_results_raw=ocr_raw,
+            resume_kg_raw=resume_kg_raw,
         )
     except KeyboardInterrupt:
         print("Stopped.")

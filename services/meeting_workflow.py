@@ -47,6 +47,45 @@ def env_flag(name: str, default: bool = False) -> bool:
     return default
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+def stage_completion_tokens(name: str, default: int) -> int:
+    hard_max = max(256, env_int("LLM_COMPLETION_MAX_TOKENS", 6400))
+    use_max_all = env_flag("LLM_USE_MAX_COMPLETION_FOR_ALL", False)
+    base_default = hard_max if use_max_all else int(default)
+    value = env_int(name, base_default)
+    return max(64, min(int(value), hard_max))
+
+
+def is_probably_incomplete_html_fragment(text: str) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if "<" not in s:
+        return False
+
+    for tag in ("table", "ul", "ol", "tr", "td", "th", "div"):
+        opens = len(re.findall(rf"<{tag}\b", s, flags=re.IGNORECASE))
+        closes = len(re.findall(rf"</{tag}>", s, flags=re.IGNORECASE))
+        if opens > closes:
+            return True
+
+    tail = s[-40:]
+    if tail.endswith("<") or tail.endswith("</"):
+        return True
+    if re.search(r"<[A-Za-z0-9:_-]+(?:\s+[^<>]*)?$", s[-120:]):
+        return True
+    return False
+
+
 @lru_cache(maxsize=1)
 def build_ocr_image_ssl_context() -> Tuple[ssl.SSLContext, bool]:
     verify = env_flag("OCR_IMAGE_SSL_VERIFY", True)
@@ -238,6 +277,20 @@ def sanitize_llm_html_fragment(text: str) -> str:
         text = text[: bleed.start()]
     text = re.sub(r"^\s*\*\*[^*\n]{2,120}\*\*\s*$", "", text, flags=re.MULTILINE)
 
+    # Drop leaked evidence citation markers from model outputs (e.g., Evidence [#123]).
+    text = re.sub(
+        r"(?i)\bข้อความใน\s*(?:evidence|source|citation)\s*\[\s*#?\d+\s*\]",
+        "ข้อความหลักฐาน",
+        text,
+    )
+    text = re.sub(r"(?i)\b(?:evidence|source|citation)\s*\[\s*#?\d+\s*\]", "หลักฐาน", text)
+    text = re.sub(r"(?i)\b(?:evidence|source|citation)\s*#\d+\b", "หลักฐาน", text)
+    text = re.sub(r"\[\s*#\d+\s*\]", "", text)
+    text = re.sub(r"\(\s*#\d+\s*\)", "", text)
+    text = re.sub(r"หลักฐาน\s+ที่", "หลักฐานที่", text)
+    text = re.sub(r"\s+และ\s*(</[a-zA-Z0-9]+>)", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
     text = re.sub(r"<h[1-3][^>]*>.*?</h[1-3]>", "", text, flags=re.IGNORECASE | re.DOTALL)
 
     # Drop junk prefix before the first meaningful section tag.
@@ -261,17 +314,56 @@ def sanitize_llm_html_fragment(text: str) -> str:
 
 
 def try_parse_json(text: str) -> Optional[Any]:
+    def _loads_with_relaxed_fixes(raw: str) -> Optional[Any]:
+        """
+        Best-effort JSON parse for model outputs that are almost valid JSON.
+        Handles common issues from LLMs:
+        - invalid raw control chars inside strings
+        - trailing commas before } or ]
+        """
+        candidate = str(raw or "")
+        # Fast path
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+        # Remove most non-printable control chars (keep \t \n \r)
+        candidate = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", " ", candidate)
+
+        max_fix_rounds = 24
+        for _ in range(max_fix_rounds):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as e:
+                msg = str(getattr(e, "msg", "") or "")
+                # LLM sometimes leaves trailing commas.
+                if "Expecting property name enclosed in double quotes" in msg or "Expecting value" in msg:
+                    cleaned = re.sub(r",(\s*[}\]])", r"\1", candidate)
+                    if cleaned != candidate:
+                        candidate = cleaned
+                        continue
+                # Replace invalid control char at exact position and retry.
+                if "Invalid control character" in msg:
+                    pos = int(getattr(e, "pos", -1))
+                    if 0 <= pos < len(candidate):
+                        candidate = candidate[:pos] + " " + candidate[pos + 1 :]
+                        continue
+                break
+            except Exception:
+                break
+        return None
+
     text = strip_code_fences(text)
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+    parsed = _loads_with_relaxed_fixes(text)
+    if parsed is not None:
+        return parsed
+
     m = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            return None
+        parsed = _loads_with_relaxed_fixes(m.group(1))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -1063,7 +1155,10 @@ class TyphoonClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
         completion_tokens: Optional[int] = None,
-        top_p: float = 0.6
+        top_p: float = 0.6,
+        json_mode: bool = False,
+        auto_continue: bool = False,
+        continue_rounds: Optional[int] = None,
     ) -> str:
         """
         completion_tokens = งบ output (ไม่ใช่ max_total)
@@ -1073,6 +1168,53 @@ class TyphoonClient:
         if completion_tokens is None:
             completion_tokens = self.default_completion_tokens
         completion_tokens = max(int(completion_tokens), self.min_completion_tokens)
+
+        if auto_continue and not json_mode and env_flag("LLM_AUTO_CONTINUE_ENABLED", True):
+            rounds = int(continue_rounds if continue_rounds is not None else env_int("LLM_AUTO_CONTINUE_MAX_ROUNDS", 2))
+            rounds = max(1, rounds)
+            text = await self.generate(
+                messages,
+                temperature=temperature,
+                completion_tokens=completion_tokens,
+                top_p=top_p,
+                json_mode=json_mode,
+                auto_continue=False,
+            )
+            if not is_probably_incomplete_html_fragment(text):
+                return text
+            logger.warning("LLM output seems truncated; auto-continue up to %d rounds", rounds)
+            combined = str(text or "")
+            for _ in range(rounds):
+                assistant_tail = combined[-20000:]
+                follow_messages = list(messages) + [
+                    {"role": "assistant", "content": assistant_tail},
+                    {
+                        "role": "user",
+                        "content": (
+                            "คำตอบก่อนหน้าถูกตัดกลางทาง ให้ตอบต่อจากจุดเดิมทันที "
+                            "ห้ามเริ่มใหม่ ห้ามอธิบายเพิ่ม ห้ามทำซ้ำช่วงเดิม "
+                            "และตอบเป็น HTML fragment ต่อเนื่องเท่านั้น"
+                        ),
+                    },
+                ]
+                extra = await self.generate(
+                    follow_messages,
+                    temperature=temperature,
+                    completion_tokens=completion_tokens,
+                    top_p=top_p,
+                    json_mode=False,
+                    auto_continue=False,
+                )
+                extra = str(extra or "").strip()
+                if not extra:
+                    break
+                merged = (combined.rstrip() + "\n" + extra).strip()
+                if merged == combined:
+                    break
+                combined = merged
+                if not is_probably_incomplete_html_fragment(combined):
+                    break
+            return combined
 
         attempt = 0
         last_err = None
@@ -1100,9 +1242,10 @@ class TyphoonClient:
         # 4) Typhoon expects max_tokens >= prompt_tokens + 1 and behaves as total token budget.
         request_max_tokens = min(self.max_request_tokens, max(total_est, completion_tokens + 1))
 
+        use_json_mode = bool(json_mode)
         while attempt < self.max_retries:
             try:
-                resp = await self.client.chat.completions.create(
+                request_kwargs: Dict[str, Any] = dict(
                     model=self.model,
                     messages=messages,
                     temperature=temperature,
@@ -1111,10 +1254,19 @@ class TyphoonClient:
                     stop=(self.stop_sequences or None),
                     stream=False,
                 )
+                if use_json_mode:
+                    request_kwargs["response_format"] = {"type": "json_object"}
+
+                resp = await self.client.chat.completions.create(**request_kwargs)
                 return resp.choices[0].message.content or ""
             except Exception as e:
                 last_err = e
                 err_text = str(e)
+
+                if use_json_mode and "response_format" in err_text.lower():
+                    logger.warning("response_format=json_object unsupported; retrying without JSON mode")
+                    use_json_mode = False
+                    continue
 
                 if "max_tokens must be at least prompt_tokens + 1" in err_text:
                     req_match = re.search(r"required:\s*(\d+)", err_text)
@@ -1443,7 +1595,11 @@ Output JSON:
 กติกา: JSON เท่านั้น
 """}
         ]
-        resp = await self.client.generate(messages, temperature=0.2, completion_tokens=1200)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.2,
+            completion_tokens=stage_completion_tokens("AGENDA_PARSE_COMPLETION_TOKENS", 1200),
+        )
         logger.info(
             "Raw AgendaParserAgent response (chars=%d)",
             len(resp or ""),
@@ -1465,7 +1621,11 @@ Output JSON:
             {"role": "system", "content": "แก้ JSON ให้ถูกต้อง ตอบเป็น JSON อย่างเดียว"},
             {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema header_lines/agendas เท่านั้น\nRAW:\n{raw}"}
         ]
-        resp = await self.client.generate(messages, temperature=0.0, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("AGENDA_PARSE_REPAIR_COMPLETION_TOKENS", 800),
+        )
         return try_parse_json(resp)
 
 
@@ -1776,9 +1936,16 @@ class ExtractorAgent:
 """
 
     def _chunk_segments(self, segments: List[TranscriptSegment], max_segments: int, overlap: int) -> List[List[Tuple[int, TranscriptSegment]]]:
+        max_segments = max(1, int(max_segments))
+        overlap = max(0, int(overlap))
+        if overlap >= max_segments:
+            overlap = max_segments - 1
+
         idx = list(enumerate(segments))
         if len(idx) <= max_segments:
             return [idx]
+
+        step = max_segments - overlap
         chunks = []
         s = 0
         while s < len(idx):
@@ -1786,7 +1953,7 @@ class ExtractorAgent:
             chunks.append(idx[s:e])
             if e == len(idx):
                 break
-            s = e - overlap
+            s += step
         return chunks
 
     def _render_chunk(self, chunk: List[Tuple[int, TranscriptSegment]]) -> str:
@@ -1799,21 +1966,94 @@ class ExtractorAgent:
             lines.append(f"[#{i}] {sp}: {txt}")
         return "\n".join(lines)
 
-    async def _extract_chunk(self, chunk_text: str, agenda_context: str) -> Dict[str, Any]:
+    def _empty_extract_result(self, parse_failed: bool = False) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"speakers": [], "topics": [], "actions": [], "decisions": []}
+        if parse_failed:
+            data["_extract_parse_failed"] = True
+        return data
+
+    def _is_parse_failed_result(self, data: Dict[str, Any]) -> bool:
+        return bool(isinstance(data, dict) and data.get("_extract_parse_failed"))
+
+    def _split_chunk_for_parse_retry(
+        self,
+        chunk: List[Tuple[int, TranscriptSegment]],
+        base_segments: int,
+        side_overlap: int,
+    ) -> List[List[Tuple[int, TranscriptSegment]]]:
+        """
+        Retry pattern requested by user for failed 30-segment chunk:
+        - 15+5 (left side)
+        - 5+15 (right side)
+        """
+        n = len(chunk)
+        base = max(2, int(base_segments))
+        overlap = max(0, int(side_overlap))
+        if n < (base * 2):
+            return []
+
+        split_at = base
+        left_end = min(n, split_at + overlap)
+        right_start = max(0, split_at - overlap)
+        left = chunk[:left_end]
+        right = chunk[right_start:]
+        if not left or not right:
+            return []
+        if left == chunk or right == chunk:
+            return []
+        return [left, right]
+
+    def _merge_extract_payloads(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        merged = self._empty_extract_result()
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            for k in ("speakers", "topics", "actions", "decisions"):
+                value = payload.get(k)
+                if isinstance(value, list) and value:
+                    merged[k].extend(value)
+        return merged
+
+    async def _extract_chunk(
+        self,
+        chunk_text: str,
+        agenda_context: str,
+        *,
+        chunk_label: str = "",
+        log_parse_warning: bool = True,
+    ) -> Dict[str, Any]:
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": f"บริบทวาระ: {agenda_context}\nTranscript:\n{chunk_text}\n\nสกัดตาม schema (JSON เท่านั้น)"}
         ]
-        resp = await self.client.generate(messages, temperature=0.2, completion_tokens=1800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.2,
+            completion_tokens=stage_completion_tokens("EXTRACT_CHUNK_COMPLETION_TOKENS", 1800),
+            json_mode=True,
+        )
         data = try_parse_json(resp)
         if not data:
             data = await self._repair(resp)
         if not data:
-            return {"speakers": [], "topics": [], "actions": [], "decisions": []}
+            if log_parse_warning:
+                raw_preview = str(resp or "")
+                max_chars = max(200, int(os.getenv("EXTRACT_LOG_JSON_MAX_CHARS", "4000")))
+                if len(raw_preview) > max_chars:
+                    raw_preview = raw_preview[:max_chars] + "...(truncated)"
+                if raw_preview.strip():
+                    logger.warning("Extract raw response (non-JSON) chunk=%s: %s", chunk_label or "-", raw_preview)
+                logger.warning("Extract chunk returned invalid JSON; try split-retry (chunk=%s)", chunk_label or "-")
+            return self._empty_extract_result(parse_failed=True)
 
         for k in ("speakers", "topics", "actions", "decisions"):
             if k not in data or not isinstance(data[k], list):
                 data[k] = []
+        parsed_json = json.dumps(data, ensure_ascii=False)
+        max_chars = max(200, int(os.getenv("EXTRACT_LOG_JSON_MAX_CHARS", "4000")))
+        if len(parsed_json) > max_chars:
+            parsed_json = parsed_json[:max_chars] + "...(truncated)"
+        # logger.info("Extract chunk response JSON (chunk=%s): %s", chunk_label or "-", parsed_json)
         return data
 
     async def _repair(self, raw: str) -> Optional[dict]:
@@ -1821,7 +2061,12 @@ class ExtractorAgent:
             {"role": "system", "content": "แก้ JSON ให้ถูกต้อง ตอบเป็น JSON อย่างเดียว"},
             {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema speakers/topics/actions/decisions\nRAW:\n{raw}"}
         ]
-        resp = await self.client.generate(messages, temperature=0.0, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("EXTRACT_REPAIR_COMPLETION_TOKENS", 800),
+            json_mode=True,
+        )
         return try_parse_json(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -1839,6 +2084,8 @@ class ExtractorAgent:
         max_segments = int(os.getenv("EXTRACT_MAX_SEGMENTS", "30"))
         overlap = int(os.getenv("EXTRACT_OVERLAP_SEGMENTS", "5"))
         chunks = self._chunk_segments(transcript.segments, max_segments=max_segments, overlap=overlap)
+        retry_base_segments = int(os.getenv("EXTRACT_FAIL_RETRY_BASE_SEGMENTS", "15"))
+        retry_side_overlap = int(os.getenv("EXTRACT_FAIL_RETRY_SIDE_OVERLAP", "5"))
 
         max_parallel = int(os.getenv("EXTRACT_MAX_PARALLEL", "1"))
         sem = asyncio.Semaphore(max_parallel)
@@ -1852,9 +2099,65 @@ class ExtractorAgent:
             async with sem:
                 txt = self._render_chunk(ch)
                 if not txt:
-                    return {"speakers": [], "topics": [], "actions": [], "decisions": []}
+                    return self._empty_extract_result()
                 logger.info("Extract chunk %d/%d (chars=%d)", ci + 1, len(chunks), len(txt))
-                return await self._extract_chunk(txt, agenda_context)
+                data = await self._extract_chunk(
+                    txt,
+                    agenda_context,
+                    chunk_label=f"{ci + 1}/{len(chunks)}",
+                    log_parse_warning=True,
+                )
+                if not self._is_parse_failed_result(data):
+                    return data
+
+                retry_chunks = self._split_chunk_for_parse_retry(
+                    ch,
+                    base_segments=retry_base_segments,
+                    side_overlap=retry_side_overlap,
+                )
+                if not retry_chunks:
+                    return self._empty_extract_result()
+
+                logger.warning(
+                    "Extract chunk %d/%d parse failed; retry split pattern (%d+%d, %d+%d)",
+                    ci + 1,
+                    len(chunks),
+                    retry_base_segments,
+                    retry_side_overlap,
+                    retry_side_overlap,
+                    retry_base_segments,
+                )
+                retry_payloads: List[Dict[str, Any]] = []
+                for ri, retry_chunk in enumerate(retry_chunks, start=1):
+                    retry_text = self._render_chunk(retry_chunk)
+                    if not retry_text:
+                        continue
+                    logger.info(
+                        "Extract retry chunk %d.%d/%d (chars=%d)",
+                        ci + 1,
+                        ri,
+                        len(retry_chunks),
+                        len(retry_text),
+                    )
+                    retry_data = await self._extract_chunk(
+                        retry_text,
+                        agenda_context,
+                        chunk_label=f"{ci + 1}.{ri}/{len(retry_chunks)}",
+                        log_parse_warning=False,
+                    )
+                    if self._is_parse_failed_result(retry_data):
+                        logger.warning(
+                            "Extract retry chunk %d.%d/%d still invalid JSON",
+                            ci + 1,
+                            ri,
+                            len(retry_chunks),
+                        )
+                        continue
+                    retry_payloads.append(retry_data)
+
+                if not retry_payloads:
+                    return self._empty_extract_result()
+                return self._merge_extract_payloads(retry_payloads)
 
         extracted = await asyncio.gather(*[run_one(i, ch) for i, ch in enumerate(chunks)])
 
@@ -2020,7 +2323,11 @@ Output JSON:
 - ตอบเป็น JSON อย่างเดียว
 """}
         ]
-        resp = await self.client.generate(messages, temperature=0.1, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("LINK_ACTIONS_COMPLETION_TOKENS", 800),
+        )
         data = try_parse_json(resp)
         if not data:
             data = await self._repair(resp, schema="action_links")
@@ -2057,7 +2364,11 @@ Output JSON:
 - ตอบเป็น JSON อย่างเดียว
 """}
         ]
-        resp = await self.client.generate(messages, temperature=0.1, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("LINK_DECISIONS_COMPLETION_TOKENS", 800),
+        )
         data = try_parse_json(resp)
         if not data:
             data = await self._repair(resp, schema="decision_links")
@@ -2156,7 +2467,11 @@ Output JSON:
             {"role": "system", "content": "แก้ JSON ให้ถูกต้อง ตอบเป็น JSON อย่างเดียว"},
             {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema {schema}\nRAW:\n{raw}"}
         ]
-        resp = await self.client.generate(messages, temperature=0.0, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("LINK_REPAIR_COMPLETION_TOKENS", 800),
+        )
         return try_parse_json(resp)
 
 
@@ -2545,7 +2860,11 @@ EVIDENCE:
         evidence_text: str,
     ) -> Dict[str, Any]:
         messages = self._build_outline_prompt(agenda, agenda_data, evidence_text)
-        resp = await self.client.generate(messages, temperature=0.15, completion_tokens=1800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.15,
+            completion_tokens=stage_completion_tokens("GEN_OUTLINE_COMPLETION_TOKENS", 1800),
+        )
         data = try_parse_json(resp)
         if not data:
             data = await self._repair_outline(resp)
@@ -2568,7 +2887,11 @@ EVIDENCE:
             {"role": "system", "content": "แก้ JSON ให้ถูกต้องตาม schema ที่กำหนด ตอบเป็น JSON เท่านั้น"},
             {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema summary_points/followup_rows/decisions/actions\nRAW:\n{raw}"}
         ]
-        resp = await self.client.generate(messages, temperature=0.0, completion_tokens=800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("GEN_OUTLINE_REPAIR_COMPLETION_TOKENS", 800),
+        )
         return try_parse_json(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -2611,7 +2934,12 @@ EVIDENCE:
                     len(ocr_lines),
                     len(evidence_text),
                 )
-                resp = await self.client.generate(messages, temperature=0.2, completion_tokens=2200)
+                resp = await self.client.generate(
+                    messages,
+                    temperature=0.2,
+                    completion_tokens=stage_completion_tokens("GEN_WRITE_COMPLETION_TOKENS", 2200),
+                    auto_continue=True,
+                )
                 return i, self._clean_html(resp)
 
         sections = await asyncio.gather(*[gen_one(i, ag) for i, ag in enumerate(agendas)])
@@ -2815,7 +3143,12 @@ SECTION เดิม:
 """,
             },
         ]
-        resp = await self.client.generate(messages, temperature=0.1, completion_tokens=2600)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("VAL_REWRITE_COMPLETION_TOKENS", 2600),
+            auto_continue=True,
+        )
         return self.helper._clean_html(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -3098,7 +3431,12 @@ SECTION เดิม:
 """,
             },
         ]
-        resp = await self.client.generate(messages, temperature=0.1, completion_tokens=2800)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("COMPLIANCE_REWRITE_COMPLETION_TOKENS", 2800),
+            auto_continue=True,
+        )
         return self.helper._clean_html(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -3287,7 +3625,12 @@ SECTION เดิม:
 """,
             },
         ]
-        resp = await self.client.generate(messages, temperature=0.1, completion_tokens=2600)
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("REACT_REVISE_COMPLETION_TOKENS", 2600),
+            auto_continue=True,
+        )
         return self.gen_helper._clean_html(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
@@ -3527,7 +3870,7 @@ class OfficialEditorAgent:
     def __init__(self, client: TyphoonClient):
         self.client = client
         self.max_parallel = int(os.getenv("OFFICIAL_EDITOR_MAX_PARALLEL", "2"))
-        self.completion_tokens = int(os.getenv("OFFICIAL_EDITOR_COMPLETION_TOKENS", "2400"))
+        self.completion_tokens = stage_completion_tokens("OFFICIAL_EDITOR_COMPLETION_TOKENS", 2400)
         self.max_evidence_lines = int(os.getenv("OFFICIAL_EDITOR_EVIDENCE_LINES", "10"))
         self.ocr_max_evidence_lines = int(
             os.getenv("OFFICIAL_EDITOR_OCR_EVIDENCE_LINES", os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "10"))
@@ -3754,6 +4097,7 @@ class OfficialEditorAgent:
 - ใช้ภาษาเขียนทางการ ห้ามภาษาพูด เช่น ครับ/ค่ะ/เอ่อ/อ่า
 - รักษาข้อเท็จจริง ชื่อบุคคล ชื่อหน่วยงาน ชื่อโครงการ และตัวเลขให้ตรงข้อมูล
 - หากข้อมูลไม่ชัดเจน ให้ระบุว่า "ไม่มีข้อมูลชัดเจน" ห้ามเดา
+- ห้ามใส่ citation หรือรหัสหลักฐาน เช่น [#123], Evidence [#123], Source [#123]
 - ห้ามแสดงกระบวนการคิด และห้ามใช้ Markdown
 - ตอบเป็น HTML fragment เท่านั้น
 """
@@ -3798,6 +4142,7 @@ Output Format (ต้องมีครบ):
 - ทุกหัวข้อใน "ประเด็นหารือ" ควรมีรายละเอียดอย่างน้อย 1-2 ประโยค
 - ถ้ามีตัวเลข ให้คงค่าตัวเลขตามหลักฐาน
 - หากไม่พบข้อมูลมติหรือ Action ให้ระบุ "ไม่มีข้อมูลชัดเจน"
+- ห้ามแสดงรหัสอ้างอิงหลักฐาน เช่น [#123] หรือ Evidence [#123] ในรายงาน
 - ห้ามลดทอนรายชื่อโครงการ/หน่วยงาน/คำเฉพาะที่มีอยู่ใน Draft Section เว้นแต่ขัดกับ Evidence โดยตรง
 - ถ้ามีคำอังกฤษ/รหัสโครงการใน Draft Section ให้คงรูปสะกดเดิมให้มากที่สุด
 """
@@ -3833,7 +4178,8 @@ Output Format (ต้องมีครบ):
                 resp = await self.client.generate(
                     messages,
                     temperature=0.1,
-                    completion_tokens=max(1200, self.completion_tokens),
+                    completion_tokens=max(1200, stage_completion_tokens("OFFICIAL_EDITOR_COMPLETION_TOKENS", self.completion_tokens)),
+                    auto_continue=True,
                 )
                 fragment = self._clean_fragment(resp)
                 if not fragment:

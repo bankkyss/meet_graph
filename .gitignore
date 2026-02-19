@@ -35,6 +35,7 @@ env/
 # Generated outputs
 output/
 test_flow_output/
+test_flow_output_new/
 Meeting_Report_*.html
 
 # Large local media/reference files
