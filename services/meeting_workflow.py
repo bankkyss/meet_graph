@@ -215,6 +215,51 @@ def strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+def sanitize_llm_html_fragment(text: str) -> str:
+    text = strip_code_fences(text)
+    if not text:
+        return ""
+
+    if "<body" in text.lower():
+        m = re.search(r"<body[^>]*>(.*?)</body>", text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            text = m.group(1)
+
+    # Hard stop on common control tokens emitted by some local LLMs.
+    for marker in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>"):
+        pos = text.find(marker)
+        if pos >= 0:
+            text = text[:pos]
+    text = re.sub(r"<\|[^>\n]{1,120}\|>", "", text)
+
+    # Remove obvious instruction bleed-through.
+    bleed = re.search(r"(?is)\bwrite a short story\b", text)
+    if bleed:
+        text = text[: bleed.start()]
+    text = re.sub(r"^\s*\*\*[^*\n]{2,120}\*\*\s*$", "", text, flags=re.MULTILINE)
+
+    text = re.sub(r"<h[1-3][^>]*>.*?</h[1-3]>", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Drop junk prefix before the first meaningful section tag.
+    first_tag = re.search(r"<(h4|ul|ol|table|p|div|blockquote)\b", text, flags=re.IGNORECASE)
+    if first_tag and first_tag.start() > 0 and text[: first_tag.start()].strip():
+        text = text[first_tag.start() :]
+
+    # If model continues with prose after the final table, trim that tail.
+    lower_text = text.lower()
+    last_table_end = lower_text.rfind("</table>")
+    if last_table_end >= 0:
+        cut = last_table_end + len("</table>")
+        tail = text[cut:]
+        if tail.strip():
+            tail_check = re.sub(r"</?(?:div|p|span|br)\b[^>]*>", "", tail, flags=re.IGNORECASE)
+            tail_check = re.sub(r"\s+", "", tail_check)
+            if tail_check:
+                text = text[:cut]
+
+    return text.strip()
+
+
 def try_parse_json(text: str) -> Optional[Any]:
     text = strip_code_fences(text)
     try:
@@ -966,6 +1011,10 @@ class TyphoonClient:
         # Evidence trimming (char-level)
         self.max_evidence_chars_default = int(os.getenv("TYPHOON_MAX_EVIDENCE_CHARS", "12000"))
         self.max_evidence_line_chars = int(os.getenv("TYPHOON_MAX_EVIDENCE_LINE_CHARS", "360"))
+        raw_stop = str(
+            os.getenv("TYPHOON_STOP_SEQUENCES", "<|endoftext|>,<|im_end|>,<|eot_id|>") or ""
+        ).strip()
+        self.stop_sequences = [x.strip() for x in raw_stop.split(",") if x.strip()]
 
     def estimate_prompt_tokens(self, messages: List[Dict[str, str]]) -> int:
         total_chars = 0
@@ -1059,6 +1108,7 @@ class TyphoonClient:
                     temperature=temperature,
                     max_tokens=request_max_tokens,
                     top_p=top_p,
+                    stop=(self.stop_sequences or None),
                     stream=False,
                 )
                 return resp.choices[0].message.content or ""
@@ -2168,12 +2218,7 @@ class GeneratorAgent:
         return txt
 
     def _clean_html(self, text: str) -> str:
-        text = strip_code_fences(text)
-        if "<body" in text.lower():
-            m = re.search(r"<body[^>]*>(.*?)</body>", text, flags=re.DOTALL | re.IGNORECASE)
-            if m:
-                text = m.group(1)
-        text = re.sub(r"<h[1-3].*?>.*?</h[1-3]>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = sanitize_llm_html_fragment(text)
         text = re.sub(r"\b(?:Part\d+_)?SPEAKER_\d+\b", "ผู้เกี่ยวข้อง", text, flags=re.IGNORECASE)
         text = re.sub(r">\\s*null\\s*<", ">ไม่ระบุ<", text, flags=re.IGNORECASE)
         return text.strip()
@@ -3521,13 +3566,7 @@ class OfficialEditorAgent:
         }
 
     def _clean_fragment(self, text: str) -> str:
-        text = strip_code_fences(text)
-        if "<body" in text.lower():
-            m = re.search(r"<body[^>]*>(.*?)</body>", text, flags=re.IGNORECASE | re.DOTALL)
-            if m:
-                text = m.group(1)
-        text = re.sub(r"<h[1-3][^>]*>.*?</h[1-3]>", "", text, flags=re.IGNORECASE | re.DOTALL)
-        return text.strip()
+        return sanitize_llm_html_fragment(text)
 
     def _token_set(self, text: str) -> List[str]:
         toks = re.findall(r"[A-Za-z0-9ก-๙_]+", normalize_text(text))
@@ -3881,7 +3920,8 @@ class AssembleAgent:
         parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
         header_lines = parsed.header_lines
         agendas = parsed.agendas
-        sections = state["agenda_sections"]
+        sections = [sanitize_llm_html_fragment(str(x or "")) for x in (state.get("agenda_sections") or [])]
+        state["agenda_sections"] = sections
         ocr_captures = state.get("ocr_captures") or []
         kg = KnowledgeGraph()
         kg.nodes = (state.get("kg") or {}).get("nodes", {})

@@ -1,0 +1,122 @@
+---
+# 1. Persistent Volume Claim (พื้นที่เก็บข้อมูล)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-data
+  namespace: n8n
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # K3s ใช้ local-path เป็น default storage class อยู่แล้ว
+  # storageClassName: local-path 
+
+---
+# 2. Service (เปิด Port 7474=HTTP, 7687=Bolt)
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j-service
+  namespace: n8n
+spec:
+  selector:
+    app: neo4j
+  ports:
+    - name: http
+      port: 7474
+      targetPort: 7474
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+  type: ClusterIP
+
+---
+# 3. StatefulSet (ตัว Database)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: n8n
+spec:
+  serviceName: "neo4j-service"
+  
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      enableServiceLinks: false
+      containers:
+      - name: neo4j
+        image: neo4j:community
+        ports:
+        - containerPort: 7474
+          name: http
+        - containerPort: 7687
+          name: bolt
+        env:
+        # --- ตั้งรหัสผ่านตรงนี้ (เปลี่ยน secret-password เป็นของคุณ) ---
+        - name: NEO4J_AUTH
+          value: "neo4j/Security@Pitch2026" 
+        # ปรับแต่งให้รองรับการเชื่อมต่อผ่าน Ingress
+        # - name: NEO4J_dbms_connector_bolt_advertised__address
+        #   value: "neo4j.sp2ai.club:443"
+        - name: NEO4J_dbms_connector_bolt_advertised__address
+          value: "bolt.sp2ai.club:443"
+        volumeMounts:
+        - name: neo4j-data
+          mountPath: /data
+      volumes:
+      - name: neo4j-data
+        persistentVolumeClaim:
+          claimName: neo4j-data
+
+---
+# 4. Ingress (ตั้งค่า Domain)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: neo4j-ingress
+  namespace: n8n
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  rules:
+  - host: neo4j.sp2ai.club
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: neo4j-service
+            port:
+              number: 7474
+  tls:
+    - hosts:
+        - neo4j.sp2ai.club
+      secretName: sp2ai-club-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: neo4j-bolt
+  namespace: n8n
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - match: HostSNI(`bolt.sp2ai.club`)
+    services:
+    - name: neo4j-service
+      port: 7687
+  tls:
+    secretName: sp2ai-club-tls

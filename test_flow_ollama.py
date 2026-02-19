@@ -125,11 +125,26 @@ def strip_code_fences(text: str) -> str:
 
 def clean_html_fragment(text: str) -> str:
     text = strip_code_fences(text)
+    for marker in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>"):
+        pos = text.find(marker)
+        if pos >= 0:
+            text = text[:pos]
+    text = re.sub(r"<\|[^>\n]{1,120}\|>", "", text)
+    bleed = re.search(r"(?is)\bwrite a short story\b", text)
+    if bleed:
+        text = text[: bleed.start()]
     if "<body" in text.lower():
         m = re.search(r"<body[^>]*>(.*?)</body>", text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             text = m.group(1)
     text = re.sub(r"<h[1-3][^>]*>.*?</h[1-3]>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    lower_text = text.lower()
+    last_table_end = lower_text.rfind("</table>")
+    if last_table_end >= 0:
+        cut = last_table_end + len("</table>")
+        tail = text[cut:]
+        if re.search(r"[A-Za-zก-๙0-9]{4,}", tail):
+            text = text[:cut]
     return text.strip()
 
 
