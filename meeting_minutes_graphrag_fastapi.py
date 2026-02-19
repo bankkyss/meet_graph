@@ -17,6 +17,7 @@ Deps:
 import json
 import logging
 import os
+import importlib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,19 +30,75 @@ from api.schemas import JobStatusResponse
 
 load_dotenv()
 
-from services.meeting_workflow import (
-    MeetingState,
-    TranscriptJSON,
-    WORKFLOW,
-    WORKFLOW_REACT,
-    build_transcript_index,
-)
+from services.workflow_types import MeetingState, TranscriptJSON
 from services.workflow_jobs import (
     JobFailedError,
     JobNotFoundError,
     JobNotReadyError,
     JobResultMissingError,
     WorkflowJobService,
+)
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    val = str(raw).strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _resolve_workflow_module_name(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return "services.meeting_workflow"
+    mapping = {
+        "meeting_workflow": "services.meeting_workflow",
+        "services.meeting_workflow": "services.meeting_workflow",
+        "default": "services.meeting_workflow",
+        "typhoon": "services.meeting_workflow",
+        "meeting_workflow_ollama": "services.meeting_workflow_ollama",
+        "services.meeting_workflow_ollama": "services.meeting_workflow_ollama",
+        "ollama": "services.meeting_workflow_ollama",
+    }
+    return mapping.get(value, raw)
+
+
+def _load_workflows(module_name: str) -> tuple[Any, Any]:
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot import workflow module '{module_name}': {exc}") from exc
+
+    try:
+        workflow = getattr(module, "WORKFLOW")
+        workflow_react = getattr(module, "WORKFLOW_REACT")
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Workflow module '{module_name}' must expose WORKFLOW and WORKFLOW_REACT"
+        ) from exc
+    return workflow, workflow_react
+
+
+def build_transcript_index(transcript: TranscriptJSON) -> dict[int, str]:
+    idx: dict[int, str] = {}
+    for i, seg in enumerate(transcript.segments):
+        speaker = (seg.speaker or "Unknown").strip() or "Unknown"
+        text = (seg.text or "").strip()
+        if text:
+            idx[i] = f"{speaker}: {text}"
+    return idx
+
+
+WORKFLOW_SELECTOR_RAW = os.getenv("WORKFLOW_MODULE") or os.getenv("WORKFLOW_BACKEND") or "meeting_workflow"
+WORKFLOW_MODULE_NAME = _resolve_workflow_module_name(WORKFLOW_SELECTOR_RAW)
+WORKFLOW, WORKFLOW_REACT = _load_workflows(WORKFLOW_MODULE_NAME)
+WORKFLOW_REQUIRES_TYPHOON_API_KEY = _env_flag(
+    "WORKFLOW_REQUIRE_TYPHOON_API_KEY",
+    default=(WORKFLOW_MODULE_NAME == "services.meeting_workflow"),
 )
 
 # =========================
@@ -52,6 +109,11 @@ app = FastAPI()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("meeting_minutes_full")
+logger.info(
+    "FastAPI workflow backend: module=%s require_typhoon_api_key=%s",
+    WORKFLOW_MODULE_NAME,
+    WORKFLOW_REQUIRES_TYPHOON_API_KEY,
+)
 JOB_SERVICE = WorkflowJobService(
     logger=logger,
     output_dir=os.getenv("JOB_OUTPUT_DIR", "output"),
@@ -87,7 +149,7 @@ async def _generate_with_workflow(
     file: UploadFile = File(...),
     ocr_file: Optional[UploadFile] = File(None),
 ):
-    if not os.getenv("TYPHOON_API_KEY"):
+    if WORKFLOW_REQUIRES_TYPHOON_API_KEY and not os.getenv("TYPHOON_API_KEY"):
         raise HTTPException(status_code=500, detail="Missing TYPHOON_API_KEY")
 
     if not (file.filename or "").endswith(".json"):

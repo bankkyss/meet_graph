@@ -40,6 +40,23 @@ spec:
               key: TYPHOON_API_KEY
         - name: LOG_LEVEL
           value: "INFO"
+        # Select workflow backend loaded by FastAPI:
+        # - meeting_workflow (Typhoon/OpenAI-compatible)
+        # - meeting_workflow_ollama (Ollama)
+        - name: WORKFLOW_BACKEND
+          value: "meeting_workflow_ollama"
+        # Require TYPHOON_API_KEY check at API layer (default true for meeting_workflow).
+        # Set to "0" when switching WORKFLOW_BACKEND=meeting_workflow_ollama and not using Typhoon key.
+        - name: WORKFLOW_REQUIRE_TYPHOON_API_KEY
+          value: "0"
+        - name: OLLAMA_BASE_URL
+          value: "http://192.168.60.27:11434"
+        - name: OLLAMA_MODEL
+          value: "scb10x/typhoon2.5-qwen3-30b-a3b:latest"
+        - name: OLLAMA_EMBED_MODEL
+          value: "qwen3-embedding:0.6b"
+        - name: OLLAMA_HYBRID_RETRIEVAL
+          value: "1"
         # - name: TYPHOON_API_BASE_URL
         #   value:  "https://api.opentyphoon.ai/v1"
         # - name: TYPHOON_MODEL
@@ -69,6 +86,9 @@ spec:
           value: "86400"
         - name: EXTRACT_MAX_PARALLEL
           value: "1"
+        # --- Optional Ollama backend settings ---
+        # - name: OLLAMA_BASE_URL
+        #   value: "http://ollama.default.svc.cluster.local:11434"
         readinessProbe:
           httpGet:
             path: /
