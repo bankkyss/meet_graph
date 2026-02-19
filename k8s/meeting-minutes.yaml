@@ -84,6 +84,23 @@ spec:
           value: "/app/output"
         - name: JOB_RETENTION_SECONDS
           value: "86400"
+        # Generation output token budget (per agenda section)
+        - name: GEN_WRITE_COMPLETION_TOKENS
+          value: "3600"
+        # Official editor output token budget (post-ReAct rewrite)
+        - name: OFFICIAL_EDITOR_COMPLETION_TOKENS
+          value: "3800"
+        # Topic time range extraction tuning (for /jobs/{job_id} topic_time_ranges)
+        # Modes: semantic | chronological | legacy
+        - name: TOPIC_TIME_MODE
+          value: "semantic"
+        - name: TOPIC_TIME_PADDING_SECONDS
+          value: "120"
+        - name: TOPIC_TIME_CLUSTER_GAP_SECONDS
+          value: "300"
+        # Keep as "0" unless you explicitly want API to force non-overlap.
+        - name: TOPIC_TIME_ENFORCE_NON_OVERLAP
+          value: "0"
         - name: EXTRACT_MAX_PARALLEL
           value: "1"
         # --- Optional Ollama backend settings ---

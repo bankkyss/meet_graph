@@ -54,7 +54,7 @@ class TyphoonClient:
 
     def __init__(self):
         self.model = os.getenv("OLLAMA_MODEL", "scb10x/typhoon2.5-qwen3-30b-a3b:latest")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.60.27:11434")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://172.20.12.7:31319")#"http://192.168.60.27:11434")#
         self.max_retries = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
         self.base_backoff = float(os.getenv("OLLAMA_BACKOFF_SEC", "1.0"))
         self.request_timeout_sec = max(5.0, float(os.getenv("OLLAMA_REQUEST_TIMEOUT_SEC", "240")))
@@ -358,18 +358,51 @@ class ExtractorAgentOllama(ExtractorAgent):
     def __init__(self, client: TyphoonClient):
         super().__init__(client)
         self.extract_completion_tokens = max(
-            300, int(os.getenv("OLLAMA_EXTRACT_COMPLETION_TOKENS", "1400"))
+            300, int(os.getenv("OLLAMA_EXTRACT_COMPLETION_TOKENS", "2500"))
         )
+        self.extract_invalid_json_retries = max(
+            0, int(os.getenv("OLLAMA_EXTRACT_INVALID_JSON_RETRIES", "1"))
+        )
+        self.extract_repair_retries = max(
+            0, int(os.getenv("OLLAMA_EXTRACT_REPAIR_RETRIES", "2"))
+        )
+
+    async def _repair_with_retry(self, raw: str) -> Optional[Dict[str, Any]]:
+        attempts = max(1, self.extract_repair_retries + 1)
+        for ai in range(attempts):
+            try:
+                data = await self._repair(raw)
+            except Exception as exc:
+                logger.warning(
+                    "Extract chunk repair failed (attempt %d/%d): %s",
+                    ai + 1,
+                    attempts,
+                    exc,
+                )
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
 
     async def _extract_chunk(self, chunk_text: str, agenda_context: str) -> Dict[str, Any]:
         started = time.monotonic()
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"บริบทวาระ: {agenda_context}\nTranscript:\n{chunk_text}\n\nสกัดตาม schema (JSON เท่านั้น)"},
-        ]
+        def _messages(strict_json: bool) -> List[Dict[str, str]]:
+            user = f"บริบทวาระ: {agenda_context}\nTranscript:\n{chunk_text}\n\nสกัดตาม schema (JSON เท่านั้น)"
+            if strict_json:
+                user += (
+                    "\n\nข้อกำหนดเพิ่ม:\n"
+                    "- ตอบเป็น JSON object อย่างเดียว\n"
+                    "- ห้ามใส่ Markdown, code fence, หรือคำอธิบายก่อน/หลัง JSON\n"
+                    "- field ต้องมี speakers/topics/actions/decisions เป็น list เสมอ"
+                )
+            return [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user},
+            ]
+
         try:
             resp = await self.client.generate(
-                messages,
+                _messages(strict_json=False),
                 temperature=0.2,
                 completion_tokens=self.extract_completion_tokens,
             )
@@ -377,13 +410,32 @@ class ExtractorAgentOllama(ExtractorAgent):
             logger.warning("Extract chunk failed: %s", exc)
             return {"speakers": [], "topics": [], "actions": [], "decisions": []}
 
-        data = try_parse_json(resp)
-        if not data:
+        data: Optional[Dict[str, Any]] = None
+        raw = resp
+        total_attempts = self.extract_invalid_json_retries + 1
+        for ai in range(total_attempts):
+            data = try_parse_json(raw)
+            if not data:
+                data = await self._repair_with_retry(raw)
+            if data:
+                break
+            if ai >= total_attempts - 1:
+                break
+            logger.warning(
+                "Extract chunk invalid JSON (attempt %d/%d); retry strict extraction",
+                ai + 1,
+                total_attempts,
+            )
             try:
-                data = await self._repair(resp)
+                raw = await self.client.generate(
+                    _messages(strict_json=True),
+                    temperature=0.0,
+                    completion_tokens=self.extract_completion_tokens,
+                )
             except Exception as exc:
-                logger.warning("Extract chunk repair failed: %s", exc)
-                data = None
+                logger.warning("Extract chunk strict retry failed: %s", exc)
+                raw = ""
+
         if not data:
             logger.warning("Extract chunk returned invalid JSON; fallback empty result")
             return {"speakers": [], "topics": [], "actions": [], "decisions": []}
@@ -417,8 +469,9 @@ class GeneratorAgentOllama(GeneratorAgent):
         self.embed_model = str(os.getenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b") or "qwen3-embedding:0.6b")
         self.embed_base_url = str(
             os.getenv("OLLAMA_EMBED_BASE_URL", getattr(client, "base_url", os.getenv("OLLAMA_BASE_URL", "")))
-            or getattr(client, "base_url", "http://127.0.0.1:11434")
+            or getattr(client, "base_url", "http://172.20.12.7:31319")
         )
+        print(f"Ollama embedding endpoint: {self.embed_base_url}")
         self.embed_endpoint = self._build_embed_endpoint(self.embed_base_url)
         self.embed_endpoint_legacy = self._build_embed_legacy_endpoint(self.embed_base_url)
         self.embed_timeout_sec = max(2.0, float(os.getenv("OLLAMA_EMBED_TIMEOUT_SEC", "25")))

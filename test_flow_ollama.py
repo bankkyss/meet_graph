@@ -26,7 +26,6 @@ import logging
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -40,7 +39,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
-def load_json(path: Path) -> Dict[str, Any]:
+def load_json(path: Path) -> Any:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
@@ -592,11 +591,27 @@ def run_react_workflow_with_progress(
     config: Dict[str, Any],
     transcript_raw: Dict[str, Any],
     ocr_results_raw: Optional[Dict[str, Any]] = None,
+    topic_time_mode: Optional[str] = None,
+    gen_write_completion_tokens: Optional[int] = None,
+    official_editor_completion_tokens: Optional[int] = None,
+    extract_completion_tokens: Optional[int] = None,
+    reuse_kg_json_path: Optional[Path] = None,
+    reuse_ocr_captures_json_path: Optional[Path] = None,
     heartbeat_sec: int = 10,
 ) -> Tuple[str, Any, Any, Dict[str, Any]]:
-    start_ts = time.time()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    fut = executor.submit(run_react_workflow, config, transcript_raw, ocr_results_raw)
+    fut = executor.submit(
+        run_react_workflow,
+        config,
+        transcript_raw,
+        ocr_results_raw,
+        topic_time_mode,
+        gen_write_completion_tokens,
+        official_editor_completion_tokens,
+        extract_completion_tokens,
+        reuse_kg_json_path,
+        reuse_ocr_captures_json_path,
+    )
     try:
         while True:
             try:
@@ -615,14 +630,49 @@ def run_react_workflow(
     config: Dict[str, Any],
     transcript_raw: Dict[str, Any],
     ocr_results_raw: Optional[Dict[str, Any]] = None,
+    topic_time_mode: Optional[str] = None,
+    gen_write_completion_tokens: Optional[int] = None,
+    official_editor_completion_tokens: Optional[int] = None,
+    extract_completion_tokens: Optional[int] = None,
+    reuse_kg_json_path: Optional[Path] = None,
+    reuse_ocr_captures_json_path: Optional[Path] = None,
 ) -> Tuple[str, Any, Any, Dict[str, Any]]:
+    def _set_env_int(name: str, value: Optional[int]) -> None:
+        if value is None:
+            return
+        try:
+            iv = int(value)
+        except Exception:
+            return
+        if iv <= 0:
+            return
+        os.environ[name] = str(iv)
+
+    _set_env_int("GEN_WRITE_COMPLETION_TOKENS", gen_write_completion_tokens)
+    _set_env_int("OFFICIAL_EDITOR_COMPLETION_TOKENS", official_editor_completion_tokens)
+    _set_env_int("OLLAMA_EXTRACT_COMPLETION_TOKENS", extract_completion_tokens)
+
     try:
         from services.meeting_workflow import (
+            OcrAugmentAgent,
             ParsedAgenda,
             TranscriptJSON,
             build_transcript_index,
+            route_react_decision,
         )
-        from services.meeting_workflow_ollama import WORKFLOW_REACT
+        from services.meeting_workflow_ollama import (
+            WORKFLOW_REACT,
+            AgendaParserAgentOllama,
+            AssembleAgent,
+            ComplianceAgentOllama,
+            GeneratorAgentOllama,
+            OfficialEditorAgent,
+            ReActCriticAgentOllama,
+            ReActPrepareAgentOllama,
+            ReActReviseAgentOllama,
+            SectionValidationAgentOllama,
+            TyphoonClient,
+        )
     except Exception as e:
         raise RuntimeError(
             f"Import workflow failed with interpreter: {sys.executable}\n"
@@ -637,8 +687,74 @@ def run_react_workflow(
         "transcript_json": transcript.model_dump(),
         "transcript_index": build_transcript_index(transcript),
     }
+    if str(topic_time_mode or "").strip():
+        init_state["topic_time_mode"] = str(topic_time_mode).strip()
     if isinstance(ocr_results_raw, dict):
         init_state["ocr_results_json"] = ocr_results_raw
+
+    if reuse_kg_json_path is not None:
+        kg_raw = load_json(reuse_kg_json_path)
+        if not isinstance(kg_raw, dict):
+            raise ValueError("--reuse-kg-json must be a JSON object")
+        if not isinstance(kg_raw.get("nodes"), dict) or not isinstance(kg_raw.get("edges"), list):
+            raise ValueError("--reuse-kg-json must contain {nodes: object, edges: list}")
+
+        print(f"[info] Reusing KG from {reuse_kg_json_path} (skip extract_kg/link_events)")
+
+        async def _run_from_cached_kg() -> Dict[str, Any]:
+            client = TyphoonClient()
+            parser = AgendaParserAgentOllama(client)
+            generator = GeneratorAgentOllama(client)
+            validator = SectionValidationAgentOllama(client)
+            compliance = ComplianceAgentOllama(client)
+            react_prepare = ReActPrepareAgentOllama(client)
+            react_critic = ReActCriticAgentOllama(client)
+            react_revise = ReActReviseAgentOllama(client)
+            official = OfficialEditorAgent(client)
+            assemble = AssembleAgent()
+
+            state: Dict[str, Any] = dict(init_state)
+            state = await parser(state)
+
+            if reuse_ocr_captures_json_path is not None:
+                reused_caps = load_json(reuse_ocr_captures_json_path)
+                if isinstance(reused_caps, list):
+                    state["ocr_captures"] = reused_caps
+                    state["ocr_augmented_count"] = int(state.get("ocr_augmented_count", 0) or 0)
+                    state["ocr_truncated_capture_count"] = int(state.get("ocr_truncated_capture_count", 0) or 0)
+                    state["ocr_truncated_chars_total"] = int(state.get("ocr_truncated_chars_total", 0) or 0)
+                else:
+                    raise ValueError("--reuse-ocr-captures-json must be a JSON array")
+            elif isinstance(ocr_results_raw, dict):
+                state = await OcrAugmentAgent()(state)
+
+            state["kg"] = {
+                "nodes": kg_raw.get("nodes") or {},
+                "edges": kg_raw.get("edges") or [],
+                "edge_attrs": kg_raw.get("edge_attrs") or {},
+            }
+            state.setdefault("actions", [])
+            state.setdefault("decisions", [])
+
+            state = await generator(state)
+            state = await validator(state)
+            state = await compliance(state)
+            state = await react_prepare(state)
+            while True:
+                state = await react_critic(state)
+                if route_react_decision(state) != "revise":
+                    break
+                state = await react_revise(state)
+            state = await official(state)
+            state = await assemble(state)
+            return state
+
+        out = asyncio.run(_run_from_cached_kg())
+        final_html = str(out.get("final_html", "") or "")
+        parsed = ParsedAgenda.model_validate(out.get("parsed_agenda", {}))
+        if not final_html:
+            raise RuntimeError("cached-KG path returned empty final_html")
+        return final_html, parsed, transcript, out
 
     async def _run_with_updates() -> Dict[str, Any]:
         merged: Dict[str, Any] = dict(init_state)
@@ -668,6 +784,28 @@ def run_react_workflow(
     return final_html, parsed, transcript, out
 
 
+def extract_topic_time_ranges(
+    *,
+    workflow_out: Dict[str, Any],
+    transcript_raw: Dict[str, Any],
+    topic_time_mode: Optional[str],
+) -> Tuple[List[Dict[str, Any]], str]:
+    try:
+        from services.workflow_jobs import WorkflowJobService
+    except Exception as e:
+        print(f"[warn] cannot import WorkflowJobService for topic ranges: {e}")
+        return [], str(topic_time_mode or "semantic")
+
+    logger = logging.getLogger("test_flow_topic_time")
+    job_service = WorkflowJobService(logger=logger)
+    ranges, used_mode = job_service._extract_topic_time_ranges(
+        workflow_out=workflow_out if isinstance(workflow_out, dict) else {},
+        transcript_json=transcript_raw if isinstance(transcript_raw, dict) else {},
+        mode=topic_time_mode,
+    )
+    return ranges, used_mode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run WORKFLOW_REACT + official rewrite (optional: attach video frames).")
     parser.add_argument("--config", default="data/config_2025-01-04.json")
@@ -680,7 +818,35 @@ def main() -> None:
         action="store_true",
         help="Force an extra local official-editor pass even though WORKFLOW_REACT already has official_editor node.",
     )
-    parser.add_argument("--editor-completion-tokens", type=int, default=2400)
+    parser.add_argument("--editor-completion-tokens", type=int, default=3200)
+    parser.add_argument(
+        "--gen-write-completion-tokens",
+        type=int,
+        default=None,
+        help="Override workflow GEN_WRITE_COMPLETION_TOKENS for agenda generation.",
+    )
+    parser.add_argument(
+        "--official-editor-completion-tokens",
+        type=int,
+        default=None,
+        help="Override workflow OFFICIAL_EDITOR_COMPLETION_TOKENS for official_editor node.",
+    )
+    parser.add_argument(
+        "--extract-completion-tokens",
+        type=int,
+        default=None,
+        help="Override OLLAMA_EXTRACT_COMPLETION_TOKENS for extractor chunk calls.",
+    )
+    parser.add_argument(
+        "--reuse-kg-json",
+        default="",
+        help="Path to previous run kg_state.json. If set, skip extract_kg/link_events.",
+    )
+    parser.add_argument(
+        "--reuse-ocr-captures-json",
+        default="",
+        help="Optional path to previous run ocr_captures_augmented.json when using --reuse-kg-json.",
+    )
     parser.add_argument("--with-images", action="store_true", help="Attach video frames into HTML")
     parser.add_argument("--ocr-json", default="", help="Path to capture_ocr_results.json (optional)")
     parser.add_argument(
@@ -701,16 +867,34 @@ def main() -> None:
         action="store_true",
         help="Save a JSON file with detailed image-to-agenda matching scores.",
     )
+    parser.add_argument(
+        "--topic-time-mode",
+        choices=["semantic", "chronological", "legacy"],
+        default=None,
+        help="Mode for topic_time_ranges extraction summary (semantic|chronological|legacy).",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
     transcript_path = Path(args.transcript)
     video_path = Path(args.video)
     ocr_path = Path(args.ocr_json) if str(args.ocr_json or "").strip() else None
+    reuse_kg_json_path = Path(args.reuse_kg_json) if str(args.reuse_kg_json or "").strip() else None
+    reuse_ocr_captures_json_path = (
+        Path(args.reuse_ocr_captures_json)
+        if str(args.reuse_ocr_captures_json or "").strip()
+        else None
+    )
     output_root = Path(args.output_dir)
 
     if args.with_images and not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
+    if reuse_kg_json_path is not None and not reuse_kg_json_path.exists():
+        raise FileNotFoundError(f"--reuse-kg-json not found: {reuse_kg_json_path}")
+    if reuse_ocr_captures_json_path is not None and not reuse_ocr_captures_json_path.exists():
+        raise FileNotFoundError(
+            f"--reuse-ocr-captures-json not found: {reuse_ocr_captures_json_path}"
+        )
 
     config = load_json(config_path)
     transcript_raw = load_json(transcript_path)
@@ -782,6 +966,12 @@ def main() -> None:
             config=config,
             transcript_raw=transcript_raw,
             ocr_results_raw=ocr_raw,
+            topic_time_mode=args.topic_time_mode,
+            gen_write_completion_tokens=args.gen_write_completion_tokens,
+            official_editor_completion_tokens=args.official_editor_completion_tokens,
+            extract_completion_tokens=args.extract_completion_tokens,
+            reuse_kg_json_path=reuse_kg_json_path,
+            reuse_ocr_captures_json_path=reuse_ocr_captures_json_path,
         )
     except KeyboardInterrupt:
         print("Stopped.")
@@ -849,12 +1039,32 @@ def main() -> None:
     if isinstance(ocr_caps_payload, list):
         ocr_caps_path.write_text(json.dumps(ocr_caps_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    topic_time_ranges, topic_time_mode_used = extract_topic_time_ranges(
+        workflow_out=out_state if isinstance(out_state, dict) else {},
+        transcript_raw=transcript_raw if isinstance(transcript_raw, dict) else {},
+        topic_time_mode=args.topic_time_mode,
+    )
+    topic_time_path = run_dir / "topic_time_ranges.json"
+    topic_time_path.write_text(
+        json.dumps(
+            {
+                "topic_time_mode": topic_time_mode_used,
+                "topic_time_ranges": topic_time_ranges,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     print(f"Created HTML: {html_path}")
     if isinstance(kg_payload, dict):
         print(f"KG JSON: {kg_path}")
     if isinstance(ocr_caps_payload, list):
         print(f"OCR captures (augmented): {ocr_caps_path}")
     print(f"Frames folder: {frames_dir}")
+    print(f"Topic time ranges: {topic_time_path}")
+    print(f"Topic time mode: {topic_time_mode_used}")
     print(f"Agenda count: {len(parsed.agendas)}")
     print(f"Officially rewritten sections (workflow): {workflow_official_rewritten_count}")
     print(f"Officially rewritten sections (extra local pass): {extra_rewritten_count}")

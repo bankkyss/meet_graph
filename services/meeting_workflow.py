@@ -215,6 +215,40 @@ def strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+def auto_close_common_html_tags(text: str) -> str:
+    """
+    Best-effort close for truncated LLM HTML fragments.
+    Only balances common container tags used by the report templates.
+    """
+    if not text:
+        return text
+    tag_re = re.compile(r"<(/?)([a-zA-Z0-9]+)([^>]*)>")
+    tracked = {"table", "thead", "tbody", "tfoot", "tr", "th", "td", "ul", "ol", "li", "div", "p", "blockquote"}
+    stack: List[str] = []
+    for m in tag_re.finditer(text):
+        closing = bool(m.group(1))
+        tag = str(m.group(2) or "").strip().lower()
+        attrs = str(m.group(3) or "")
+        if tag not in tracked:
+            continue
+        if closing:
+            if not stack:
+                continue
+            # Only consume a closing tag if it matches the latest opened tracked tag.
+            # For truncated fragments, mismatched closing tags are common (e.g. </div> inside <td>),
+            # and force-popping would erase required closings such as </table>.
+            if stack[-1] == tag:
+                stack.pop()
+            continue
+        # opening tag
+        if attrs.strip().endswith("/"):
+            continue
+        stack.append(tag)
+    if not stack:
+        return text
+    return text + "".join(f"</{t}>" for t in reversed(stack))
+
+
 def sanitize_llm_html_fragment(text: str) -> str:
     text = strip_code_fences(text)
     if not text:
@@ -244,6 +278,8 @@ def sanitize_llm_html_fragment(text: str) -> str:
     first_tag = re.search(r"<(h4|ul|ol|table|p|div|blockquote)\b", text, flags=re.IGNORECASE)
     if first_tag and first_tag.start() > 0 and text[: first_tag.start()].strip():
         text = text[first_tag.start() :]
+
+    text = auto_close_common_html_tags(text)
 
     # If model continues with prose after the final table, trim that tail.
     lower_text = text.lower()
@@ -1836,7 +1872,7 @@ class ExtractorAgent:
             kg.add_agenda(a.title)
 
         # token-safe chunking
-        max_segments = int(os.getenv("EXTRACT_MAX_SEGMENTS", "30"))
+        max_segments = int(os.getenv("EXTRACT_MAX_SEGMENTS", "20"))
         overlap = int(os.getenv("EXTRACT_OVERLAP_SEGMENTS", "5"))
         chunks = self._chunk_segments(transcript.segments, max_segments=max_segments, overlap=overlap)
 
@@ -1958,6 +1994,9 @@ class LinkerAgent:
         self.system_prompt = "คุณคือผู้ช่วยจับคู่ actions/decisions เข้ากับวาระ ต้องตอบเป็น JSON เท่านั้น"
         self.max_items_per_call = int(os.getenv("LINK_MAX_ITEMS_PER_CALL", "40"))
         self.fallback_min_score = float(os.getenv("LINK_FALLBACK_MIN_SCORE", "0.10"))
+        self.topic_time_mode_default = self._resolve_topic_time_mode(
+            os.getenv("TOPIC_TIME_MODE", "semantic")
+        )
 
     def _compress_for_linking(self, actions: List[ActionEvent], decisions: List[DecisionEvent]) -> Tuple[List[Dict], List[Dict]]:
         compressed_actions = []
@@ -1997,6 +2036,121 @@ class LinkerAgent:
         if best_title and best_score >= self.fallback_min_score:
             return best_title
         return None
+
+    def _resolve_topic_time_mode(self, raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        if not value:
+            return "semantic"
+        mapping = {
+            "semantic": "semantic",
+            "cluster": "semantic",
+            "overlap": "semantic",
+            "default": "semantic",
+            "chronological": "chronological",
+            "agenda_order": "chronological",
+            "agenda": "chronological",
+            "non_overlap": "chronological",
+            "strict": "chronological",
+            "legacy": "legacy",
+            "minmax": "legacy",
+            "legacy_minmax": "legacy",
+        }
+        return mapping.get(value, "semantic")
+
+    def _coerce_segments(self, state: "MeetingState") -> List[Dict[str, Any]]:
+        transcript_json = state.get("transcript_json")
+        if not isinstance(transcript_json, dict):
+            return []
+        segments = transcript_json.get("segments")
+        if not isinstance(segments, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for seg in segments:
+            if isinstance(seg, dict):
+                out.append(seg)
+            else:
+                out.append({})
+        return out
+
+    def _event_time_from_segment_ids(self, segment_ids: Optional[List[int]], segments: List[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(segment_ids, list) or not segments:
+            return None
+        times: List[float] = []
+        for sid in segment_ids:
+            if not isinstance(sid, int):
+                continue
+            if sid < 0 or sid >= len(segments):
+                continue
+            seg = segments[sid]
+            st = safe_float(seg.get("start"), -1.0)
+            ed = safe_float(seg.get("end"), -1.0)
+            if st < 0 and ed < 0:
+                continue
+            if st < 0:
+                st = ed
+            if ed < 0:
+                ed = st
+            times.append((st + ed) / 2.0)
+        if not times:
+            return None
+        times.sort()
+        return times[len(times) // 2]
+
+    def _coerce_title_to_index(self, title: Optional[str], agenda_titles: List[str]) -> Optional[int]:
+        if not title:
+            return None
+        txt = str(title or "")
+        if txt in agenda_titles:
+            return agenda_titles.index(txt)
+        fuzzy = best_fuzzy_match(txt, agenda_titles, threshold=0.35)
+        if fuzzy and fuzzy in agenda_titles:
+            return agenda_titles.index(fuzzy)
+        return None
+
+    def _best_agenda_index_for_topic(self, topic_title: str, agendas: List[AgendaItem]) -> Optional[int]:
+        probe = str(topic_title or "").strip()
+        if not probe:
+            return None
+        best_idx = None
+        best_score = 0.0
+        for i, ag in enumerate(agendas):
+            scope_text = " ".join([ag.title] + (ag.details or []))
+            sc = token_overlap_score(probe, scope_text)
+            if sc > best_score:
+                best_score = sc
+                best_idx = i
+        if best_idx is None:
+            return None
+        if best_score < self.fallback_min_score:
+            return None
+        return best_idx
+
+    def _monotonic_assign(self, rows: List[Dict[str, Any]], agenda_count: int) -> List[Dict[str, Any]]:
+        if agenda_count <= 0 or not rows:
+            return rows
+        ordered = sorted(
+            rows,
+            key=lambda r: (
+                r.get("time") is None,
+                float(r.get("time")) if r.get("time") is not None else float("inf"),
+                int(r.get("cand")) if r.get("cand") is not None else agenda_count,
+            ),
+        )
+        last_idx = 0
+        for r in ordered:
+            cand = r.get("cand")
+            cand_idx = int(cand) if isinstance(cand, int) else None
+            if cand_idx is None:
+                assigned = last_idx
+            else:
+                assigned = max(last_idx, cand_idx)
+            if assigned < 0:
+                assigned = 0
+            if assigned > agenda_count - 1:
+                assigned = agenda_count - 1
+            r["assigned"] = assigned
+            last_idx = assigned
+        return rows
 
     async def _link_actions_batch(self, agenda_titles: List[str], batch: List[Dict[str, Any]]) -> Dict[int, Optional[str]]:
         messages = [
@@ -2076,6 +2230,9 @@ Output JSON:
         parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
         agendas = parsed.agendas
         agenda_titles = [a.title for a in agendas]
+        mode = self._resolve_topic_time_mode(state.get("topic_time_mode") or self.topic_time_mode_default)
+        chronological_mode = mode == "chronological"
+        segments = self._coerce_segments(state)
 
         actions = [ActionEvent(**a) for a in state.get("actions", [])]
         decisions = [DecisionEvent(**d) for d in state.get("decisions", [])]
@@ -2113,6 +2270,41 @@ Output JSON:
                 linked = self._best_agenda_from_probe(probe, agendas)
             d.linked_agenda = linked
 
+        if chronological_mode and agenda_titles:
+            rows: List[Dict[str, Any]] = []
+            for i, a in enumerate(actions):
+                rows.append(
+                    {
+                        "kind": "action",
+                        "idx": i,
+                        "cand": self._coerce_title_to_index(a.linked_agenda, agenda_titles),
+                        "time": self._event_time_from_segment_ids(a.source_segments, segments),
+                    }
+                )
+            for i, d in enumerate(decisions):
+                rows.append(
+                    {
+                        "kind": "decision",
+                        "idx": i,
+                        "cand": self._coerce_title_to_index(d.linked_agenda, agenda_titles),
+                        "time": self._event_time_from_segment_ids(d.source_segments, segments),
+                    }
+                )
+            self._monotonic_assign(rows, len(agenda_titles))
+            for row in rows:
+                assigned = row.get("assigned")
+                if not isinstance(assigned, int):
+                    continue
+                assigned_title = agenda_titles[assigned]
+                if row.get("kind") == "action":
+                    idx = int(row.get("idx", -1))
+                    if 0 <= idx < len(actions):
+                        actions[idx].linked_agenda = assigned_title
+                elif row.get("kind") == "decision":
+                    idx = int(row.get("idx", -1))
+                    if 0 <= idx < len(decisions):
+                        decisions[idx].linked_agenda = assigned_title
+
         state["actions"] = [a.__dict__ for a in actions]
         state["decisions"] = [d.__dict__ for d in decisions]
 
@@ -2140,13 +2332,34 @@ Output JSON:
                 ag = kg.add_agenda(d.linked_agenda)
                 kg.add_edge(ag, "has_decision", did)
 
-        # link agenda->topic by overlap
-        for ag in agendas:
-            agid = kg.add_agenda(ag.title)
+        if chronological_mode and agenda_titles:
+            topic_rows: List[Dict[str, Any]] = []
             for nid, node in kg.nodes.items():
-                if node.get("type") == "topic":
-                    if token_overlap_score(ag.title, node.get("title", "")) >= 0.35:
-                        kg.add_edge(agid, "has_topic", nid)
+                if node.get("type") != "topic":
+                    continue
+                topic_rows.append(
+                    {
+                        "topic_id": nid,
+                        "cand": self._best_agenda_index_for_topic(str(node.get("title", "") or ""), agendas),
+                        "time": self._event_time_from_segment_ids(node.get("source_segments") or [], segments),
+                    }
+                )
+            self._monotonic_assign(topic_rows, len(agenda_titles))
+            for row in topic_rows:
+                assigned = row.get("assigned")
+                topic_id = row.get("topic_id")
+                if not isinstance(assigned, int) or not isinstance(topic_id, str):
+                    continue
+                agid = kg.add_agenda(agenda_titles[assigned])
+                kg.add_edge(agid, "has_topic", topic_id)
+        else:
+            # link agenda->topic by overlap (semantic mode)
+            for ag in agendas:
+                agid = kg.add_agenda(ag.title)
+                for nid, node in kg.nodes.items():
+                    if node.get("type") == "topic":
+                        if token_overlap_score(ag.title, node.get("title", "")) >= 0.35:
+                            kg.add_edge(agid, "has_topic", nid)
 
         state["kg"] = {"nodes": kg.nodes, "edges": kg.edges, "edge_attrs": kg.edge_attrs}
         return state
@@ -2198,6 +2411,7 @@ class GeneratorAgent:
         self.evidence_line_chars = int(os.getenv("GEN_EVIDENCE_LINE_CHARS", "360"))
         self.max_followup_rows = int(os.getenv("GEN_MAX_FOLLOWUP_ROWS", "18"))
         self.max_action_rows = int(os.getenv("GEN_MAX_ACTION_ROWS", "20"))
+        self.write_completion_tokens = int(os.getenv("GEN_WRITE_COMPLETION_TOKENS", "3600"))
         self.min_evidence_ids = int(os.getenv("GEN_MIN_EVIDENCE_IDS", "12"))
         self.fallback_evidence_topk = int(os.getenv("GEN_FALLBACK_EVIDENCE_TOPK", "40"))
         self.ocr_max_evidence_lines = int(os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "10"))
@@ -2611,7 +2825,11 @@ EVIDENCE:
                     len(ocr_lines),
                     len(evidence_text),
                 )
-                resp = await self.client.generate(messages, temperature=0.2, completion_tokens=2200)
+                resp = await self.client.generate(
+                    messages,
+                    temperature=0.2,
+                    completion_tokens=max(1200, self.write_completion_tokens),
+                )
                 return i, self._clean_html(resp)
 
         sections = await asyncio.gather(*[gen_one(i, ag) for i, ag in enumerate(agendas)])
@@ -3527,7 +3745,7 @@ class OfficialEditorAgent:
     def __init__(self, client: TyphoonClient):
         self.client = client
         self.max_parallel = int(os.getenv("OFFICIAL_EDITOR_MAX_PARALLEL", "2"))
-        self.completion_tokens = int(os.getenv("OFFICIAL_EDITOR_COMPLETION_TOKENS", "2400"))
+        self.completion_tokens = int(os.getenv("OFFICIAL_EDITOR_COMPLETION_TOKENS", "3800"))
         self.max_evidence_lines = int(os.getenv("OFFICIAL_EDITOR_EVIDENCE_LINES", "10"))
         self.ocr_max_evidence_lines = int(
             os.getenv("OFFICIAL_EDITOR_OCR_EVIDENCE_LINES", os.getenv("GEN_OCR_MAX_EVIDENCE_LINES", "10"))
@@ -3567,6 +3785,18 @@ class OfficialEditorAgent:
 
     def _clean_fragment(self, text: str) -> str:
         return sanitize_llm_html_fragment(text)
+
+    def _has_unbalanced_core_tags(self, text: str) -> bool:
+        src = str(text or "")
+        if not src:
+            return True
+        tags = ("table", "tr", "td", "th", "ul", "ol", "li")
+        for tag in tags:
+            opened = len(re.findall(rf"<{tag}\b[^>]*>", src, flags=re.IGNORECASE))
+            closed = len(re.findall(rf"</{tag}>", src, flags=re.IGNORECASE))
+            if closed < opened:
+                return True
+        return False
 
     def _token_set(self, text: str) -> List[str]:
         toks = re.findall(r"[A-Za-z0-9ก-๙_]+", normalize_text(text))
@@ -3836,6 +4066,12 @@ Output Format (ต้องมีครบ):
                     completion_tokens=max(1200, self.completion_tokens),
                 )
                 fragment = self._clean_fragment(resp)
+                if fragment and self._has_unbalanced_core_tags(fragment):
+                    logger.warning(
+                        "Official editor produced truncated HTML for agenda '%s'; fallback to validated section",
+                        ag.title,
+                    )
+                    fragment = ""
                 if not fragment:
                     fragment = self._clean_fragment(sec)
                 return i, fragment

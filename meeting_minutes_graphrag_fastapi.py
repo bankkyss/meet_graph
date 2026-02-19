@@ -148,6 +148,7 @@ async def _generate_with_workflow(
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
     ocr_file: Optional[UploadFile] = File(None),
+    topic_time_mode: Optional[str] = Form(None),
 ):
     if WORKFLOW_REQUIRES_TYPHOON_API_KEY and not os.getenv("TYPHOON_API_KEY"):
         raise HTTPException(status_code=500, detail="Missing TYPHOON_API_KEY")
@@ -207,6 +208,10 @@ async def _generate_with_workflow(
         "transcript_json": transcript.model_dump(),
         "transcript_index": build_transcript_index(transcript),
     }
+    topic_time_mode_clean = str(topic_time_mode or "").strip()
+    if topic_time_mode_clean:
+        init_state["topic_time_mode"] = topic_time_mode_clean
+        logger.info("Topic time mode requested: %s", topic_time_mode_clean)
     if ocr_raw is not None:
         init_state["ocr_results_json"] = ocr_raw
         cap_count = len(ocr_raw.get("captures", [])) if isinstance(ocr_raw.get("captures"), list) else 0
@@ -227,6 +232,7 @@ async def generate_report(
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
     ocr_file: Optional[UploadFile] = File(None),
+    topic_time_mode: Optional[str] = Form(None),
 ):
     return await _generate_with_workflow(
         workflow=WORKFLOW,
@@ -236,6 +242,7 @@ async def generate_report(
         agenda_text=agenda_text,
         file=file,
         ocr_file=ocr_file,
+        topic_time_mode=topic_time_mode,
     )
 
 
@@ -245,6 +252,7 @@ async def generate_report_react(
     agenda_text: str = Form(...),
     file: UploadFile = File(...),
     ocr_file: Optional[UploadFile] = File(None),
+    topic_time_mode: Optional[str] = Form(None),
 ):
     if ocr_file is not None and (ocr_file.filename or "").strip():
         logger.info("OCR file received on /generate_react")
@@ -257,6 +265,7 @@ async def generate_report_react(
         agenda_text=agenda_text,
         file=file,
         ocr_file=ocr_file,
+        topic_time_mode=topic_time_mode,
     )
 
 

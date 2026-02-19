@@ -50,6 +50,7 @@ class MeetingState(TypedDict, total=False):
     agenda_text: str
     transcript_json: Dict[str, Any]
     transcript_index: Dict[int, str]
+    topic_time_mode: str
     ocr_results_json: Dict[str, Any]
     ocr_captures: List[Dict[str, Any]]
     ocr_augmented_count: int
