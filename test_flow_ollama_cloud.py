@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run generate_react flow locally with official rewrite.
+Run generate_react cloud flow locally.
 Optionally attach frames from video into final HTML.
 
 Default inputs:
@@ -9,9 +9,9 @@ Default inputs:
 - data/video1862407925.mp4
 
 Output:
-- test_flow_output/run_<timestamp>/Meeting_Report_ReAct_official_<timestamp>.html
-- (optional) test_flow_output/run_<timestamp>/Meeting_Report_ReAct_with_video_<timestamp>.html
-- (optional) test_flow_output/run_<timestamp>/frames/*.jpg
+- test_flow_output_cloud/run_<timestamp>/Meeting_Report_ReAct_official_<timestamp>.html
+- (optional) test_flow_output_cloud/run_<timestamp>/Meeting_Report_ReAct_with_video_<timestamp>.html
+- (optional) test_flow_output_cloud/run_<timestamp>/frames/*.jpg
 """
 
 from __future__ import annotations
@@ -552,7 +552,7 @@ async def rewrite_sections_official_async(
     config: Dict[str, Any],
     completion_tokens: int = 6400,
 ) -> Tuple[str, int]:
-    from services.meeting_workflow_ollama import TyphoonClient
+    from services.meeting_workflow_cloud import TyphoonClient
 
     agendas = list(parsed.agendas)
     blocks = extract_agenda_blocks(final_html, agendas)
@@ -650,7 +650,7 @@ def run_react_workflow(
             build_transcript_index,
             route_react_decision,
         )
-        from services.meeting_workflow_ollama import (
+        from services.meeting_workflow_cloud import (
             WORKFLOW_REACT,
             TyphoonClient,
             AgendaParserAgentOllama,
@@ -662,17 +662,15 @@ def run_react_workflow(
             ReActCriticAgentOllama,
             ReActDecideAgent,
             ReActReviseAgentOllama,
-            OfficialEditorAgent,
+            ClaimVerificationAgentOllama,
             TableFormatterAgentOllama,
-            FinalReActGuardAgentOllama,
             AssembleAgent,
-            route_final_react_guard,
         )
     except Exception as e:
         raise RuntimeError(
-            f"Import workflow failed with interpreter: {sys.executable}\n"
-            f"Original error: {e}\n"
-            "Use project venv interpreter directly: `.venv/bin/python test_flow_ollama.py ...`"
+                f"Import cloud workflow failed with interpreter: {sys.executable}\n"
+                f"Original error: {e}\n"
+            "Use project venv interpreter directly: `.venv/bin/python test_flow_ollama_cloud.py ...`"
         ) from e
 
     transcript = TranscriptJSON.model_validate(transcript_raw)
@@ -741,9 +739,8 @@ def run_react_workflow(
         react_critic = ReActCriticAgentOllama(client)
         react_decide = ReActDecideAgent()
         react_revise = ReActReviseAgentOllama(client)
-        official_editor = OfficialEditorAgent(client)
+        claim_verify = ClaimVerificationAgentOllama(client)
         table_formatter = TableFormatterAgentOllama(client)
-        final_react_guard = FinalReActGuardAgentOllama(client)
         assemble = AssembleAgent()
 
         state = await _call_node("parse_agenda", parse_agenda, state)
@@ -761,29 +758,22 @@ def run_react_workflow(
         state = await _call_node("compliance_sections", compliance_sections, state)
         state = await _call_node("react_prepare", react_prepare, state)
 
-        react_guard = 0
+        guard = 0
         while True:
             state = await _call_node("react_critic", react_critic, state)
             state = await _call_node("react_decide", react_decide, state)
             route = route_react_decision(state)
             print(f"[route] react_decide -> {route}", flush=True)
-            if route == "revise":
-                state = await _call_node("react_revise", react_revise, state)
-                react_guard += 1
-                if react_guard > max(4, int(state.get("react_max_loops", 2)) + 2):
-                    print("[warn] react revise guard hit; continue to official_editor", flush=True)
-                    break
-                continue
+            if route != "revise":
+                break
+            state = await _call_node("react_revise", react_revise, state)
+            guard += 1
+            if guard > max(4, int(state.get("react_max_loops", 2)) + 2):
+                print("[warn] react revise guard hit; continue to claim_verify/table_formatter", flush=True)
+                break
 
-            state = await _call_node("official_editor", official_editor, state)
-            state = await _call_node("table_formatter", table_formatter, state)
-            state = await _call_node("final_react_guard", final_react_guard, state)
-            final_route = route_final_react_guard(state)
-            print(f"[route] final_react_guard -> {final_route}", flush=True)
-            if final_route == "revise":
-                print("[warn] final_react_guard requested revise but final_revise is disabled; continue to assemble", flush=True)
-            break
-
+        state = await _call_node("claim_verify", claim_verify, state)
+        state = await _call_node("table_formatter", table_formatter, state)
         state = await _call_node("assemble", assemble, state)
         return state
 
@@ -801,16 +791,16 @@ def run_react_workflow(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run WORKFLOW_REACT + official rewrite (optional: attach video frames).")
+    parser = argparse.ArgumentParser(description="Run WORKFLOW_REACT cloud (evidence-locked, deterministic formatter).")
     parser.add_argument("--config", default="data/config_2025-01-04.json")
     parser.add_argument("--transcript", default="data/transcript_2025-01-04.json")
     parser.add_argument("--video", default="data/video1862407925.mp4")
-    parser.add_argument("--output-dir", default="test_flow_output")
+    parser.add_argument("--output-dir", default="test_flow_output_cloud")
     parser.add_argument("--skip-official-editor", action="store_true", help="Skip extra local official-editor pass.")
     parser.add_argument(
         "--force-second-official-editor",
         action="store_true",
-        help="Force an extra local official-editor pass even though WORKFLOW_REACT already has official_editor node.",
+        help="Force an extra local official-editor pass (disabled by default for cloud flow).",
     )
     parser.add_argument("--editor-completion-tokens", type=int, default=6400)
     parser.add_argument("--with-images", action="store_true", help="Attach video frames into HTML")
@@ -938,12 +928,11 @@ def main() -> None:
         return
 
     workflow_official_rewritten_count = int(out_state.get("official_rewritten_count", 0) or 0)
+    workflow_claim_verify_flagged_count = int(out_state.get("claim_verification_flagged_count", 0) or 0)
+    workflow_claim_verify_rewritten_count = int(out_state.get("claim_verification_rewritten_count", 0) or 0)
     workflow_table_formatter_count = int(out_state.get("table_formatter_rewritten_count", 0) or 0)
-    workflow_final_guard_failed_count = int(out_state.get("final_react_guard_failed_count", 0) or 0)
-    workflow_final_guard_rewritten_count = int(out_state.get("final_react_guard_rewritten_count", 0) or 0)
     extra_rewritten_count = 0
-    # Keep workflow output as default.
-    # Extra local official-editor pass is opt-in only because it can over-rewrite and hallucinate.
+    # Cloud flow keeps citations from generator; disable extra local editor by default.
     run_extra_editor = (not args.skip_official_editor) and args.force_second_official_editor
     if run_extra_editor:
         print("Running extra local official editor pass (formal style + references + few-shot)...")
@@ -961,7 +950,7 @@ def main() -> None:
             print(f"[warn] extra local official-editor failed: {e}")
             print("[warn] keep workflow output as-is.")
     elif not args.skip_official_editor:
-        print("[info] extra local official-editor is disabled by default; use --force-second-official-editor.")
+        print("[info] cloud flow disables extra local official-editor by default; use --force-second-official-editor.")
 
     run_id = now_ts()
     run_dir = output_root / f"run_{run_id}"
@@ -1003,9 +992,9 @@ def main() -> None:
     print(f"Frames folder: {frames_dir}")
     print(f"Agenda count: {len(parsed.agendas)}")
     print(f"Officially rewritten sections (workflow): {workflow_official_rewritten_count}")
+    print(f"Claim verification flagged sections (workflow): {workflow_claim_verify_flagged_count}")
+    print(f"Claim verification rewritten sections (workflow): {workflow_claim_verify_rewritten_count}")
     print(f"Table-formatted sections (workflow): {workflow_table_formatter_count}")
-    print(f"Final ReAct guard failed sections (workflow): {workflow_final_guard_failed_count}")
-    print(f"Final ReAct guard rewritten sections (workflow): {workflow_final_guard_rewritten_count}")
     print(f"Officially rewritten sections (extra local pass): {extra_rewritten_count}")
     print(f"Extracted frames: {len(frame_files)}")
     print(f"Injected images in HTML: {injected_count}")

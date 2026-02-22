@@ -427,6 +427,94 @@ class ExtractorAgentOllama(ExtractorAgent):
         self.extract_completion_tokens = max(
             300, int(os.getenv("OLLAMA_EXTRACT_COMPLETION_TOKENS", str(default_extract_tokens)))
         )
+        self.system_prompt = (
+            self.system_prompt
+            + "\nกฎเพิ่ม:\n"
+            + "- ห้ามเดาชื่อบุคคลจากบริบท ถ้า speaker ไม่ชัดเจนให้คงเป็น speaker_1/speaker_2/... หรือ Unknown เท่านั้น\n"
+            + "- ห้ามแทน speaker_XX ด้วยชื่อจริงที่ไม่มีใน transcript"
+        )
+
+    def _source_speaker_map(self, chunk_text: str) -> Dict[int, str]:
+        mapping: Dict[int, str] = {}
+        for line in str(chunk_text or "").splitlines():
+            m = re.match(r"^\[\#(\d+)\]\s*([^:]+)\s*:\s*", line.strip())
+            if not m:
+                continue
+            sid = safe_int(m.group(1), -1)
+            speaker = re.sub(r"\s+", " ", m.group(2) or "").strip()
+            if sid >= 0 and speaker:
+                mapping[sid] = speaker
+        return mapping
+
+    def _normalize_speaker_name(
+        self,
+        name: str,
+        segment_ids: List[int],
+        source_speaker_map: Dict[int, str],
+        source_speaker_set: set,
+    ) -> str:
+        raw = re.sub(r"\s+", " ", str(name or "")).strip() or "Unknown"
+        raw_l = raw.lower()
+        if raw in source_speaker_set:
+            return raw
+        if re.fullmatch(r"(?:part\d+_)?speaker[_\-\s]?\d+", raw_l):
+            return raw.replace("-", "_").replace(" ", "_")
+        if raw_l in {"unknown", "unk", "ไม่ทราบ", "ไม่ชัดเจน"}:
+            return "Unknown"
+        for sid in segment_ids:
+            src = source_speaker_map.get(int(sid))
+            if src:
+                return src
+        return "speaker_1"
+
+    def _normalize_speakers_with_source(self, data: Dict[str, Any], chunk_text: str) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return data
+        source_speaker_map = self._source_speaker_map(chunk_text)
+        source_speaker_set = set(source_speaker_map.values())
+        speakers = data.get("speakers")
+        if not isinstance(speakers, list):
+            return data
+
+        normalized_speakers: List[Dict[str, Any]] = []
+        kept_names: set = set()
+        for sp in speakers:
+            if not isinstance(sp, dict):
+                continue
+            segment_ids = [sid for sid in (sp.get("segment_ids") or []) if isinstance(sid, int)]
+            normalized_name = self._normalize_speaker_name(
+                sp.get("name"),
+                segment_ids,
+                source_speaker_map,
+                source_speaker_set,
+            )
+            key = normalize_text(normalized_name)
+            topics = [str(x).strip() for x in (sp.get("topics_discussed") or []) if str(x).strip()]
+            if key in kept_names:
+                continue
+            kept_names.add(key)
+            normalized_speakers.append(
+                {
+                    "name": normalized_name,
+                    "topics_discussed": topics,
+                    "segment_ids": segment_ids,
+                }
+            )
+
+        data["speakers"] = normalized_speakers
+        for topic in (data.get("topics") or []):
+            if not isinstance(topic, dict):
+                continue
+            rel = []
+            for rs in (topic.get("related_speakers") or []):
+                s = re.sub(r"\s+", " ", str(rs or "")).strip()
+                if not s:
+                    continue
+                s_norm = self._normalize_speaker_name(s, topic.get("segment_ids") or [], source_speaker_map, source_speaker_set)
+                rel.append(s_norm)
+            if rel:
+                topic["related_speakers"] = list(dict.fromkeys(rel))
+        return data
 
     async def _extract_chunk(
         self,
@@ -473,6 +561,7 @@ class ExtractorAgentOllama(ExtractorAgent):
         for k in ("speakers", "topics", "actions", "decisions"):
             if k not in data or not isinstance(data[k], list):
                 data[k] = []
+        data = self._normalize_speakers_with_source(data, chunk_text)
         parsed_json = json.dumps(data, ensure_ascii=False)
         max_chars = max(200, int(os.getenv("EXTRACT_LOG_JSON_MAX_CHARS", "4000")))
         if len(parsed_json) > max_chars:
@@ -1027,6 +1116,311 @@ class GeneratorAgentOllama(GeneratorAgent):
 
         return lines or super()._collect_ocr_evidence_lines(agenda, ocr_captures)
 
+    def _normalize_evidence_ids(self, ids: Any, fallback_ids: List[int]) -> List[int]:
+        out: List[int] = []
+        seen = set()
+        for x in (ids or []):
+            if not isinstance(x, int):
+                continue
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        if out:
+            return out[:6]
+        return [int(x) for x in (fallback_ids or [])[:3] if isinstance(x, int)]
+
+    def _citation_text(self, ids: Any, fallback_ids: List[int]) -> str:
+        keep = self._normalize_evidence_ids(ids, fallback_ids)
+        if not keep:
+            return "[#NA]"
+        return " ".join([f"[#{x}]" for x in keep])
+
+    def _extract_evidence_claims(self, evidence_text: str, max_items: int = 8) -> List[Dict[str, Any]]:
+        claims: List[Dict[str, Any]] = []
+        seen = set()
+        for line in str(evidence_text or "").splitlines():
+            m = re.match(r"^\[\#(\d+)\]\s*(.+)$", line.strip())
+            if not m:
+                continue
+            sid = safe_int(m.group(1), -1)
+            txt = re.sub(r"\s+", " ", m.group(2) or "").strip()
+            if sid < 0 or not txt:
+                continue
+            if len(txt) > 200:
+                txt = txt[:200].rstrip() + "..."
+            key = normalize_text(txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            claims.append({"text": txt, "evidence_ids": [sid]})
+            if len(claims) >= max(1, int(max_items)):
+                break
+        return claims
+
+    def _render_html_from_outline(
+        self,
+        outline: Dict[str, Any],
+        fallback_ids: List[int],
+        evidence_text: str,
+    ) -> str:
+        summary_points = outline.get("summary_points") or []
+        followup_rows = outline.get("followup_rows") or []
+        decisions = outline.get("decisions") or []
+        actions = outline.get("actions") or []
+
+        bullets: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add_bullet(text: str, ev_ids: Any) -> None:
+            t = re.sub(r"\s+", " ", str(text or "")).strip()
+            if not t:
+                return
+            key = normalize_text(t)
+            if key in seen:
+                return
+            seen.add(key)
+            bullets.append({"text": t, "evidence_ids": self._normalize_evidence_ids(ev_ids, fallback_ids)})
+
+        for item in summary_points:
+            if isinstance(item, dict):
+                add_bullet(item.get("text"), item.get("evidence_ids"))
+            else:
+                add_bullet(str(item or ""), fallback_ids)
+        for row in followup_rows:
+            if isinstance(row, dict):
+                add_bullet(row.get("detail") or row.get("topic"), row.get("evidence_ids"))
+        for item in decisions:
+            if isinstance(item, dict):
+                add_bullet(item.get("text"), item.get("evidence_ids"))
+        for item in actions:
+            if isinstance(item, dict):
+                add_bullet(item.get("task"), item.get("evidence_ids"))
+        if len(bullets) < 6:
+            for item in self._extract_evidence_claims(evidence_text, max_items=12):
+                add_bullet(item.get("text"), item.get("evidence_ids"))
+                if len(bullets) >= 6:
+                    break
+        bullets = bullets[:12] or [{"text": "ไม่มีข้อมูลชัดเจน", "evidence_ids": fallback_ids}]
+
+        summary_html = "\n".join(
+            f"<li>{escape(x.get('text', 'ไม่มีข้อมูลชัดเจน'))} {self._citation_text(x.get('evidence_ids'), fallback_ids)}</li>"
+            for x in bullets
+        )
+
+        follow_rows_html: List[str] = []
+        if not isinstance(followup_rows, list):
+            followup_rows = []
+        for row in followup_rows[: max(1, self.max_followup_rows)]:
+            if not isinstance(row, dict):
+                continue
+            dep = re.sub(r"\s+", " ", str(row.get("department", "") or "")).strip() or "ผู้เกี่ยวข้อง"
+            topic = re.sub(r"\s+", " ", str(row.get("topic", "") or "")).strip() or "ไม่มีข้อมูลชัดเจน"
+            detail = re.sub(r"\s+", " ", str(row.get("detail", "") or "")).strip() or "ไม่มีข้อมูลชัดเจน"
+            note = re.sub(r"\s+", " ", str(row.get("note", "") or "")).strip() or "-"
+            cite = self._citation_text(row.get("evidence_ids"), fallback_ids)
+            follow_rows_html.append(
+                "<tr>"
+                f"<td>{escape(dep)}</td>"
+                f"<td>{escape(topic)}</td>"
+                f"<td>{escape(detail)} {cite}</td>"
+                f"<td>{escape(note)}</td>"
+                "</tr>"
+            )
+        if not follow_rows_html:
+            follow_rows_html.append(
+                "<tr><td>ผู้เกี่ยวข้อง</td><td>ไม่มีข้อมูลชัดเจน</td><td>ไม่มีข้อมูลชัดเจน [#NA]</td><td>-</td></tr>"
+            )
+
+        decision_html: List[str] = []
+        if isinstance(decisions, list):
+            for item in decisions[: max(1, self.max_action_rows)]:
+                if not isinstance(item, dict):
+                    continue
+                txt = re.sub(r"\s+", " ", str(item.get("text", "") or "")).strip()
+                if not txt:
+                    continue
+                decision_html.append(
+                    f"<li>{escape(txt)} {self._citation_text(item.get('evidence_ids'), fallback_ids)}</li>"
+                )
+        if not decision_html:
+            decision_html = ["<li>ไม่มีข้อมูลชัดเจน [#NA]</li>"]
+
+        action_rows_html: List[str] = []
+        if isinstance(actions, list):
+            for item in actions[: max(1, self.max_action_rows)]:
+                if not isinstance(item, dict):
+                    continue
+                task = re.sub(r"\s+", " ", str(item.get("task", "") or "")).strip() or "ไม่มีข้อมูลชัดเจน"
+                owner = re.sub(r"\s+", " ", str(item.get("owner", "") or "")).strip() or "ผู้เกี่ยวข้อง"
+                due = re.sub(r"\s+", " ", str(item.get("due", "") or "")).strip() or "ไม่ระบุ"
+                note = re.sub(r"\s+", " ", str(item.get("note", "") or "")).strip() or "-"
+                cite = self._citation_text(item.get("evidence_ids"), fallback_ids)
+                action_rows_html.append(
+                    "<tr>"
+                    f"<td>{escape(task)} {cite}</td>"
+                    f"<td>{escape(owner)}</td>"
+                    f"<td>{escape(due)}</td>"
+                    f"<td>{escape(note)}</td>"
+                    "</tr>"
+                )
+        if not action_rows_html:
+            action_rows_html.append(
+                "<tr><td>ไม่มีข้อมูลชัดเจน [#NA]</td><td>ผู้เกี่ยวข้อง</td><td>ไม่ระบุ</td><td>-</td></tr>"
+            )
+
+        return (
+            "<h4>สรุปประเด็น</h4>\n"
+            f"<ul>{summary_html}</ul>\n"
+            "<h4>ตารางติดตาม</h4>\n"
+            "<table>\n"
+            "<tr><th>รายชื่อฝ่าย</th><th>หัวข้อติดตาม</th><th>รายละเอียดติดตาม</th><th>หมายเหตุ</th></tr>\n"
+            + "\n".join(follow_rows_html)
+            + "\n</table>\n"
+            "<h4>มติที่ประชุม</h4>\n"
+            "<ul>"
+            + "\n".join(decision_html)
+            + "</ul>\n"
+            "<h4>Action Items</h4>\n"
+            "<table>\n"
+            "<tr><th>งาน</th><th>ผู้รับผิดชอบ</th><th>กำหนดการ</th><th>หมายเหตุ</th></tr>\n"
+            + "\n".join(action_rows_html)
+            + "\n</table>"
+        )
+
+    async def _generate_outline_json(
+        self,
+        agenda: Any,
+        agenda_data: Dict[str, Any],
+        evidence_text: str,
+    ) -> Dict[str, Any]:
+        topics, actions, decisions = self._filter_agenda_data_for_scope(agenda, agenda_data)
+        compact = {
+            "agenda_title": agenda.title,
+            "agenda_scope": agenda.details,
+            "topics": [{"title": t.get("title"), "details": (t.get("details") or "")[:420]} for t in topics][:self.max_followup_rows],
+            "decisions": [{"description": (d.get("description") or "")[:240]} for d in decisions][:self.max_action_rows],
+            "actions": [{
+                "description": (a.get("description") or "")[:240],
+                "assignee": self._normalize_owner(a.get("assignee")),
+                "deadline": a.get("deadline") or "ไม่ระบุ",
+            } for a in actions][:self.max_action_rows],
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "คุณคือ extractor รายงานประชุมแบบ evidence-locked "
+                    "ต้องตอบเป็น JSON เท่านั้น ห้ามเติมข้อเท็จจริงนอกหลักฐาน"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""สร้าง JSON รายงานวาระนี้จากหลักฐานเท่านั้น
+
+วาระ: {agenda.title}
+ข้อมูลย่อ:
+{json.dumps(compact, ensure_ascii=False)}
+
+EVIDENCE:
+{evidence_text}
+
+ข้อบังคับ:
+- ทุก claim ต้องมี evidence_ids เป็น [#segment_id] อย่างน้อย 1 ค่า
+- ห้ามรวมหลายโครงการ/หลายฝ่ายแบบรวบยอด (Do not generalize)
+- ถ้าไม่มีหลักฐานพอ ให้ใช้ข้อความ "ไม่มีข้อมูลชัดเจน" พร้อม evidence_ids ที่เกี่ยวข้องเท่าที่มี
+- ห้ามแต่งชื่อคน/ตัวเลข/วันที่ใหม่
+
+ตัวอย่างที่ห้ามเขียน:
+- "มีการประชุมเตรียมงานกีฬาภายในวันที่ 10 มกราคม 2568" ทั้งที่ไม่มีใน EVIDENCE
+- "เครื่องเจียร์ Makita 7 นิ้วเสียหาย 600 บาท" ถ้า EVIDENCE ไม่ได้ระบุ
+
+Output JSON schema:
+{{
+  "summary_points":[{{"text":"...","evidence_ids":[1,2]}}],
+  "followup_rows":[
+    {{"department":"...","topic":"...","detail":"...","note":"...","evidence_ids":[1]}}
+  ],
+  "decisions":[{{"text":"...","evidence_ids":[1]}}],
+  "actions":[{{"task":"...","owner":"...","due":"...","note":"...","evidence_ids":[1]}}]
+}}
+JSON เท่านั้น
+""",
+            },
+        ]
+        raw = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("GEN_OUTLINE_COMPLETION_TOKENS", 1800),
+            json_mode=True,
+        )
+        data = try_parse_json(raw)
+        if isinstance(data, dict):
+            return data
+        repair_messages = [
+            {"role": "system", "content": "แก้ JSON ให้ถูกต้องตาม schema ที่กำหนด ตอบเป็น JSON เท่านั้น"},
+            {
+                "role": "user",
+                "content": (
+                    "แก้ JSON ต่อไปนี้ให้ตรง schema "
+                    "summary_points/followup_rows/decisions/actions โดยทุกรายการต้องมี evidence_ids\n"
+                    f"RAW:\n{raw}"
+                ),
+            },
+        ]
+        repaired = await self.client.generate(
+            repair_messages,
+            temperature=0.0,
+            completion_tokens=stage_completion_tokens("GEN_OUTLINE_REPAIR_COMPLETION_TOKENS", 900),
+            json_mode=True,
+        )
+        fixed = try_parse_json(repaired)
+        if isinstance(fixed, dict):
+            return fixed
+        return {
+            "summary_points": [{"text": f"วาระ {agenda.title}", "evidence_ids": []}],
+            "followup_rows": [],
+            "decisions": [],
+            "actions": [],
+        }
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
+        agendas = parsed.agendas
+        transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
+
+        kg = KnowledgeGraph()
+        kg.nodes = state["kg"]["nodes"]
+        kg.edges = state["kg"]["edges"]
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+
+        sem = asyncio.Semaphore(self.max_parallel)
+
+        async def gen_one(i: int, ag: Any) -> Tuple[int, str]:
+            async with sem:
+                agenda_data = kg.query_agenda(ag.title)
+                ids = self._collect_evidence_ids(ag, agenda_data, transcript_index)
+                evidence_text = self._build_evidence_text(transcript_index, ids)
+                ocr_lines = self._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
+                outline = await self._generate_outline_json(ag, agenda_data, evidence_text)
+                html_fragment = self._render_html_from_outline(outline, ids, evidence_text)
+                logger.info(
+                    "Generate(cloud) %d/%d agenda=%s evidence_ids=%d ocr_lines=%d",
+                    i + 1,
+                    len(agendas),
+                    ag.title,
+                    len(ids),
+                    len(ocr_lines),
+                )
+                return i, self._clean_html(html_fragment)
+
+        sections = await asyncio.gather(*[gen_one(i, ag) for i, ag in enumerate(agendas)])
+        state["agenda_sections"] = [h for _, h in sorted(sections, key=lambda x: x[0])]
+        return state
+
 
 class SectionValidationAgentOllama(SectionValidationAgent):
     def __init__(self, client: TyphoonClient):
@@ -1068,6 +1462,70 @@ class ReActReflexionAgentOllama(ReActReflexionAgent):
             "citation",
             "unknown",
         }
+
+    async def _revise_once(
+        self,
+        agenda: Any,
+        section_html: str,
+        agenda_data: Dict[str, Any],
+        checklist: List[str],
+        evidence_text: str,
+        tool_report: Dict[str, Any],
+    ) -> str:
+        compact = {
+            "agenda_title": agenda.title,
+            "agenda_scope": agenda.details[:20],
+            "checklist": checklist[:20],
+            "topics": [{"title": t.get("title"), "details": (t.get("details") or "")[:280]} for t in (agenda_data.get("topics") or [])][:18],
+            "decisions": [{"description": (d.get("description") or "")[:220]} for d in (agenda_data.get("decisions") or [])][:20],
+            "actions": [{
+                "description": (a.get("description") or "")[:220],
+                "assignee": (a.get("assignee") or "ผู้เกี่ยวข้อง"),
+                "deadline": (a.get("deadline") or "ไม่ระบุ"),
+            } for a in (agenda_data.get("actions") or [])][:24],
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "คุณคือ ReAct revision editor แบบ evidence-locked "
+                    "แก้ได้เฉพาะส่วนที่ critic ระบุ ห้ามแต่งข้อเท็จจริงใหม่"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""ปรับปรุง section ตามผลเครื่องมือ (เฉพาะจุด)
+
+วาระ: {agenda.title}
+
+TOOL_REPORT:
+{json.dumps(tool_report, ensure_ascii=False)}
+
+ข้อมูลอ้างอิง:
+{json.dumps(compact, ensure_ascii=False)}
+
+EVIDENCE (ต้องยึดตามนี้เท่านั้น):
+{evidence_text}
+
+SECTION เดิม:
+{section_html}
+
+กติกาแก้ไข:
+1) แก้ได้เฉพาะรายการที่ TOOL_REPORT ระบุว่าไม่ผ่าน
+2) ห้ามแต่งข้อเท็จจริงใหม่ ห้ามเพิ่มตัวเลข/วันที่/ชื่อโครงการที่ไม่มีใน EVIDENCE
+3) คงโครง 4 ส่วนเดิม และคง citation เดิมในส่วนที่ไม่ได้ถูกแก้
+4) ห้ามลบรายละเอียดที่มีหลักฐานรองรับอยู่แล้ว
+5) ตอบเป็น HTML fragment เท่านั้น
+""",
+            },
+        ]
+        resp = await self.client.generate(
+            messages,
+            temperature=0.1,
+            completion_tokens=stage_completion_tokens("REACT_REVISE_COMPLETION_TOKENS", 2600),
+            auto_continue=True,
+        )
+        return self.gen_helper._clean_html(resp)
 
     def _plain_text(self, value: str) -> str:
         text = re.sub(r"<[^>]+>", " ", str(value or ""))
@@ -1272,11 +1730,361 @@ class ReActReviseAgentOllama(ReActReviseAgent):
         self.max_parallel = self.react.max_parallel
 
 
+class ClaimVerificationAgentOllama:
+    """
+    Verify generated agenda sections against retrieved evidence and sanitize citations.
+    - Flags out-of-evidence numeric claims / invalid citations
+    - Optionally rewrites flagged sections from evidence-locked JSON->HTML pipeline
+    """
+
+    def __init__(self, client: TyphoonClient):
+        self.client = client
+        self.enabled = env_flag("CLAIM_VERIFY_ENABLED", True)
+        self.auto_rewrite = env_flag("CLAIM_VERIFY_AUTO_REWRITE", True)
+        self.max_parallel = max(1, int(os.getenv("CLAIM_VERIFY_MAX_PARALLEL", "2")))
+        self.max_unexpected_numbers = max(0, int(os.getenv("CLAIM_VERIFY_MAX_UNEXPECTED_NUMBERS", "0")))
+        self.max_unexpected_number_ratio = max(
+            0.0,
+            min(1.0, float(os.getenv("CLAIM_VERIFY_MAX_UNEXPECTED_NUMBER_RATIO", "0.0"))),
+        )
+        self.max_invalid_citations = max(0, int(os.getenv("CLAIM_VERIFY_MAX_INVALID_CITATIONS", "0")))
+        self.helper = GeneratorAgentOllama(client)
+
+    def _plain_text(self, value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", str(value or ""))
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _normalize_number_token(self, token: str) -> str:
+        raw = str(token or "").strip().rstrip(".,")
+        if not raw:
+            return ""
+        return raw.replace(",", "")
+
+    def _extract_number_tokens(self, value: str) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for m in re.finditer(r"\b\d[\d,]*(?:\.\d+)?%?\b", str(value or "")):
+            raw = str(m.group(0) or "").strip().rstrip(".,")
+            if not raw:
+                continue
+            norm = self._normalize_number_token(raw)
+            if not norm:
+                continue
+            if len(norm.rstrip("%")) < 2 and not norm.endswith("%"):
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append(norm)
+        return out
+
+    def _normalize_citation_markup(self, html: str) -> str:
+        text = str(html or "")
+        text = re.sub(
+            r"(?:การยืนยันจาก\s*)?(?:evidence|หลักฐาน)\s*\[\s*#\s*(\d+)\s*\]",
+            r"[#\1]",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"\[\s*#\s*(\d+)\s*\]", r"[#\1]", text)
+        text = re.sub(r"(?:\s*\[#\d+\]){2,}", lambda m: " " + " ".join(dict.fromkeys(re.findall(r"\[#\d+\]", m.group(0)))), text)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text
+
+    def _extract_section_citations(self, html: str) -> List[int]:
+        out: List[int] = []
+        seen = set()
+        for m in re.finditer(r"\[\s*#\s*(\d+)\s*\]", str(html or "")):
+            sid = safe_int(m.group(1), -1)
+            if sid < 0 or sid in seen:
+                continue
+            seen.add(sid)
+            out.append(sid)
+        return out
+
+    def _sanitize_citations(self, html: str, valid_ids: set[int]) -> str:
+        text = self._normalize_citation_markup(html)
+
+        def _replace(m: re.Match[str]) -> str:
+            sid = safe_int(m.group(1), -1)
+            return f"[#{sid}]" if sid in valid_ids else ""
+
+        text = re.sub(r"\[\s*#\s*(\d+)\s*\]", _replace, text)
+        text = re.sub(r"\(\s*\)", "", text)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text.strip()
+
+    def _build_verified_claims(self, evidence_text: str, evidence_ids: List[int]) -> Dict[str, Any]:
+        lines = self.helper._extract_evidence_claims(evidence_text, max_items=64)
+        numbers = self._extract_number_tokens(re.sub(r"\[\s*#\s*\d+\s*\]", " ", evidence_text))
+        return {
+            "segment_ids": sorted({int(x) for x in (evidence_ids or []) if isinstance(x, int)}),
+            "numbers": sorted(set(numbers)),
+            "claims": lines,
+        }
+
+    def _check_section(
+        self,
+        section_html: str,
+        verified: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        evidence_ids = list(verified.get("segment_ids") or [])
+        valid_set = set(evidence_ids)
+        normalized = self._normalize_citation_markup(section_html)
+        cited_ids = self._extract_section_citations(normalized)
+        invalid_citations = [sid for sid in cited_ids if sid not in valid_set]
+        sanitized = self._sanitize_citations(normalized, valid_set)
+
+        section_plain = self._plain_text(re.sub(r"\[\s*#\s*\d+\s*\]", " ", sanitized))
+        evidence_numbers = set(str(x) for x in (verified.get("numbers") or []))
+        section_numbers = set(self._extract_number_tokens(section_plain))
+        unexpected_numbers = sorted([x for x in section_numbers if x and x not in evidence_numbers])
+        unexpected_ratio = (
+            float(len(unexpected_numbers)) / float(max(1, len(section_numbers)))
+            if section_numbers
+            else 0.0
+        )
+
+        flagged = (
+            len(invalid_citations) > self.max_invalid_citations
+            or len(unexpected_numbers) > self.max_unexpected_numbers
+            or unexpected_ratio > self.max_unexpected_number_ratio
+        )
+        report = {
+            "flagged": bool(flagged),
+            "invalid_citations_count": len(invalid_citations),
+            "invalid_citations": invalid_citations[:12],
+            "unexpected_numbers_count": len(unexpected_numbers),
+            "unexpected_numbers_ratio": unexpected_ratio,
+            "unexpected_numbers": unexpected_numbers[:16],
+            "verified_segment_count": len(evidence_ids),
+            "verified_number_count": len(evidence_numbers),
+        }
+        return report, sanitized
+
+    def _sanitize_outline_with_verified_claims(
+        self,
+        outline: Dict[str, Any],
+        verified: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        valid_ids = [int(x) for x in (verified.get("segment_ids") or []) if isinstance(x, int)]
+        valid_id_set = set(valid_ids)
+        valid_numbers = set(str(x) for x in (verified.get("numbers") or []))
+
+        def normalize_ids(raw_ids: Any) -> List[int]:
+            out: List[int] = []
+            seen = set()
+            for x in (raw_ids or []):
+                if not isinstance(x, int):
+                    continue
+                if x not in valid_id_set or x in seen:
+                    continue
+                seen.add(x)
+                out.append(x)
+            if out:
+                return out
+            return valid_ids[:2]
+
+        def allowed_text(value: str) -> bool:
+            nums = self._extract_number_tokens(str(value or ""))
+            if not nums:
+                return True
+            if not valid_numbers:
+                return False
+            for n in nums:
+                if n not in valid_numbers:
+                    return False
+            return True
+
+        clean: Dict[str, Any] = {
+            "summary_points": [],
+            "followup_rows": [],
+            "decisions": [],
+            "actions": [],
+        }
+
+        for item in outline.get("summary_points") or []:
+            if not isinstance(item, dict):
+                continue
+            txt = str(item.get("text", "") or "").strip()
+            if not txt or not allowed_text(txt):
+                continue
+            clean["summary_points"].append(
+                {"text": txt, "evidence_ids": normalize_ids(item.get("evidence_ids"))}
+            )
+
+        for row in outline.get("followup_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            dep = str(row.get("department", "") or "").strip() or "ผู้เกี่ยวข้อง"
+            topic = str(row.get("topic", "") or "").strip() or "ไม่มีข้อมูลชัดเจน"
+            detail = str(row.get("detail", "") or "").strip() or "ไม่มีข้อมูลชัดเจน"
+            note = str(row.get("note", "") or "").strip() or "-"
+            joined = " ".join([topic, detail, note])
+            if not allowed_text(joined):
+                continue
+            clean["followup_rows"].append(
+                {
+                    "department": dep,
+                    "topic": topic,
+                    "detail": detail,
+                    "note": note,
+                    "evidence_ids": normalize_ids(row.get("evidence_ids")),
+                }
+            )
+
+        for item in outline.get("decisions") or []:
+            if not isinstance(item, dict):
+                continue
+            txt = str(item.get("text", "") or "").strip()
+            if not txt or not allowed_text(txt):
+                continue
+            clean["decisions"].append(
+                {"text": txt, "evidence_ids": normalize_ids(item.get("evidence_ids"))}
+            )
+
+        for item in outline.get("actions") or []:
+            if not isinstance(item, dict):
+                continue
+            task = str(item.get("task", "") or "").strip() or "ไม่มีข้อมูลชัดเจน"
+            owner = str(item.get("owner", "") or "").strip() or "ผู้เกี่ยวข้อง"
+            due = str(item.get("due", "") or "").strip() or "ไม่ระบุ"
+            note = str(item.get("note", "") or "").strip() or "-"
+            joined = " ".join([task, owner, due, note])
+            if not allowed_text(joined):
+                continue
+            clean["actions"].append(
+                {
+                    "task": task,
+                    "owner": owner,
+                    "due": due,
+                    "note": note,
+                    "evidence_ids": normalize_ids(item.get("evidence_ids")),
+                }
+            )
+
+        if not clean["summary_points"]:
+            for c in verified.get("claims") or []:
+                if not isinstance(c, dict):
+                    continue
+                txt = str(c.get("text", "") or "").strip()
+                if not txt:
+                    continue
+                clean["summary_points"].append(
+                    {
+                        "text": txt,
+                        "evidence_ids": normalize_ids(c.get("evidence_ids")),
+                    }
+                )
+                if len(clean["summary_points"]) >= 6:
+                    break
+
+        if not clean["summary_points"]:
+            clean["summary_points"] = [
+                {
+                    "text": "ไม่มีข้อมูลชัดเจน",
+                    "evidence_ids": valid_ids[:2],
+                }
+            ]
+
+        return clean
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        if not self.enabled:
+            state["claim_verification_reports"] = []
+            state["claim_verification_flagged_count"] = 0
+            state["claim_verification_rewritten_count"] = 0
+            return state
+
+        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
+        agendas = parsed.agendas
+        sections = state.get("agenda_sections") or []
+        transcript_index = state.get("transcript_index") or {}
+        ocr_captures = state.get("ocr_captures") or []
+        if not agendas or not sections:
+            state["claim_verification_reports"] = []
+            state["claim_verification_flagged_count"] = 0
+            state["claim_verification_rewritten_count"] = 0
+            return state
+
+        kg = KnowledgeGraph()
+        kg.nodes = (state.get("kg") or {}).get("nodes", {})
+        kg.edges = (state.get("kg") or {}).get("edges", [])
+        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+
+        sem = asyncio.Semaphore(self.max_parallel)
+
+        async def verify_one(i: int, ag: Any, sec: str) -> Tuple[int, str, Dict[str, Any], bool]:
+            async with sem:
+                agenda_data = kg.query_agenda(ag.title)
+                ids = self.helper._collect_evidence_ids(ag, agenda_data, transcript_index)
+                evidence_text = self.helper._build_evidence_text(transcript_index, ids)
+                ocr_lines = self.helper._collect_ocr_evidence_lines(ag, ocr_captures)
+                if ocr_lines:
+                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
+
+                verified = self._build_verified_claims(evidence_text, ids)
+                report, sanitized_section = self._check_section(sec, verified)
+                final_section = sanitized_section
+                rewritten = False
+
+                if report["flagged"] and self.auto_rewrite:
+                    try:
+                        outline = await self.helper._generate_outline_json(ag, agenda_data, evidence_text)
+                        outline = self._sanitize_outline_with_verified_claims(outline, verified)
+                        regenerated = self.helper._render_html_from_outline(outline, ids, evidence_text)
+                        final_section = self.helper._clean_html(regenerated)
+                        rewritten = True
+                    except Exception as exc:
+                        logger.warning(
+                            "Claim verify rewrite failed %d/%d agenda=%s: %s",
+                            i + 1,
+                            len(agendas),
+                            ag.title,
+                            exc,
+                        )
+
+                report["index"] = i
+                report["agenda_title"] = ag.title
+                report["rewritten"] = rewritten
+                logger.info(
+                    "Claim verify %d/%d flagged=%s unexpected_numbers=%d invalid_citations=%d rewritten=%s",
+                    i + 1,
+                    len(agendas),
+                    report["flagged"],
+                    report["unexpected_numbers_count"],
+                    report["invalid_citations_count"],
+                    rewritten,
+                )
+                return i, self.helper._clean_html(final_section), report, rewritten
+
+        verified_sections = await asyncio.gather(
+            *[
+                verify_one(i, ag, sections[i] if i < len(sections) else "")
+                for i, ag in enumerate(agendas)
+            ]
+        )
+
+        ordered = sorted(verified_sections, key=lambda x: x[0])
+        state["agenda_sections"] = [html for _, html, _, _ in ordered]
+        reports = [rep for _, _, rep, _ in ordered]
+        state["claim_verification_reports"] = reports
+        state["claim_verification_flagged_count"] = sum(1 for rep in reports if rep.get("flagged"))
+        state["claim_verification_rewritten_count"] = sum(1 for _, _, _, rw in ordered if rw)
+        logger.info(
+            "Claim verification done flagged=%d rewritten=%d",
+            state["claim_verification_flagged_count"],
+            state["claim_verification_rewritten_count"],
+        )
+        return state
+
+
 class TableFormatterAgentOllama:
     """
     Final formatting node:
     - keep facts but reshape section into formal table-oriented HTML
-    - runs after official_editor and before assemble
+    - runs before assemble (deterministic by default)
     """
 
     def __init__(self, client: TyphoonClient):
@@ -1305,11 +2113,6 @@ class TableFormatterAgentOllama:
             50,
             int(os.getenv("TABLE_FORMATTER_MIN_ACCEPT_SUMMARY_CHARS", "50")),
         )
-        self.placeholder_summary_markers = [
-            "เรียบเรียงบริบทวาระโดยคงรายละเอียดเดิมจากข้อมูลต้นฉบับ",
-            "[สรุปบริบทวาระจากข้อมูลจริง]",
-            "รายละเอียดวาระโดยคงรายละเอียดเดิม",
-        ]
 
     def _plain_text(self, text: str) -> str:
         s = re.sub(r"<[^>]+>", " ", str(text or ""))
@@ -1370,13 +2173,6 @@ class TableFormatterAgentOllama:
             return len(self._plain_text(m.group(1)))
         before_table = text.split("<table", 1)[0]
         return len(self._plain_text(before_table))
-
-    def _has_placeholder_summary(self, html: str) -> bool:
-        text = self._plain_text(str(html or "")).lower()
-        for marker in self.placeholder_summary_markers:
-            if marker and marker.lower() in text:
-                return True
-        return False
 
     def _extract_source_rows(self, source_html: str) -> List[Tuple[str, str, str, str]]:
         out: List[Tuple[str, str, str, str]] = []
@@ -1522,7 +2318,6 @@ class TableFormatterAgentOllama:
         too_brief = (
             row_count < 1
             or summary_chars < self.min_accept_summary_chars
-            or self._has_placeholder_summary(html)
             or (detail_lengths and short_detail > max(1, len(detail_lengths) // 2))
             or (len(norm_details) >= 3 and dup_ratio > self.max_duplicate_detail_ratio)
             or strict_small_number_mismatch
@@ -1575,7 +2370,7 @@ class TableFormatterAgentOllama:
 
 รูปแบบบังคับ:
 <h4>รายละเอียดวาระ</h4>
-<p>[สรุปบริบทวาระจากข้อมูลจริง]</p>
+<p>เรียบเรียงบริบทวาระโดยคงรายละเอียดเดิมจากข้อมูลต้นฉบับ</p>
 <table>
   <tr>
     <th>งาน/ประเด็น</th>
@@ -1638,13 +2433,14 @@ class TableFormatterAgentOllama:
                 original = self._clean(sec)
                 source_rows = self._extract_source_rows(original)
                 if source_rows:
-                    # Deterministic first: avoid second LLM reformat that can output template placeholders.
+                    # Deterministic path by default: avoid second LLM pass that can accumulate hallucinations.
                     deterministic = self._build_fallback_table(
                         ag.title,
                         original,
                         max(1, len(source_rows)),
                     )
                     return i, self._clean(deterministic), True
+
                 target_rows = self._target_rows_from_source(original)
                 messages = self._build_messages(ag.title, list(ag.details or []), original, target_rows)
                 try:
@@ -1720,455 +2516,6 @@ class TableFormatterAgentOllama:
         return state
 
 
-class FinalReActGuardAgentOllama:
-    """
-    Final safety gate before assemble:
-    - validate final section against agenda scope + evidence completeness
-    - detect likely hallucinated numbers
-    - if failed, fallback to deterministic evidence-based table
-    """
-
-    def __init__(self, client: TyphoonClient):
-        self.client = client
-        self.enabled = env_flag("FINAL_REACT_GUARD_ENABLED", True)
-        self.fallback_on_fail = env_flag("FINAL_REACT_GUARD_FALLBACK_ON_FAIL", True)
-        self.max_parallel = max(1, int(os.getenv("FINAL_REACT_GUARD_MAX_PARALLEL", "2")))
-        self.min_coverage = max(0.0, min(1.0, float(os.getenv("FINAL_REACT_GUARD_MIN_COVERAGE", "0.70"))))
-        self.max_offscope_ratio = max(
-            0.0,
-            min(1.0, float(os.getenv("FINAL_REACT_GUARD_MAX_OFFSCOPE_RATIO", "0.55"))),
-        )
-        self.max_unexpected_numbers = max(0, int(os.getenv("FINAL_REACT_GUARD_MAX_UNEXPECTED_NUMBERS", "0")))
-        self.max_unexpected_number_ratio = max(
-            0.0,
-            min(1.0, float(os.getenv("FINAL_REACT_GUARD_MAX_UNEXPECTED_NUMBER_RATIO", "0.20"))),
-        )
-        self.max_rows = max(3, int(os.getenv("FINAL_REACT_GUARD_MAX_ROWS", "12")))
-        self.react = ReActReflexionAgentOllama(client)
-        self.helper = self.react.gen_helper
-
-    def _plain_text(self, value: str) -> str:
-        text = re.sub(r"<[^>]+>", " ", str(value or ""))
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    def _has_table(self, html: str) -> bool:
-        lower = str(html or "").lower()
-        return "<table" in lower and "</table>" in lower
-
-    def _table_row_count(self, html: str) -> int:
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", str(html or ""), flags=re.IGNORECASE | re.DOTALL)
-        count = 0
-        for row in rows:
-            if re.search(r"<td\b", row, flags=re.IGNORECASE):
-                count += 1
-        return count
-
-    def _extract_number_tokens(self, text: str) -> List[str]:
-        out: List[str] = []
-        seen = set()
-        for m in re.finditer(r"\b\d[\d,]*(?:\.\d+)?%?\b", str(text or "")):
-            raw = str(m.group(0) or "").strip().rstrip(".,")
-            if not raw:
-                continue
-            key = raw.replace(",", "")
-            if len(key.rstrip("%")) < 2 and not key.endswith("%"):
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(key)
-        return out
-
-    def _extract_evidence_rows(self, evidence_text: str) -> List[Tuple[int, str]]:
-        out: List[Tuple[int, str]] = []
-        seen = set()
-        for line in str(evidence_text or "").splitlines():
-            m = re.match(r"^\[\#(\d+)\]\s*(.+)$", line.strip())
-            if not m:
-                continue
-            sid = safe_int(m.group(1), -1)
-            txt = re.sub(r"\s+", " ", str(m.group(2) or "")).strip()
-            if sid < 0 or not txt:
-                continue
-            key = normalize_text(txt)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append((sid, txt))
-            if len(out) >= self.max_rows:
-                break
-        return out
-
-    def _build_evidence_fallback_table(self, agenda_title: str, evidence_text: str) -> str:
-        rows = self._extract_evidence_rows(evidence_text)
-        if not rows:
-            rows = [(-1, "ไม่มีข้อมูลชัดเจนจากหลักฐานในรอบนี้")]
-
-        summary_parts = [txt for _, txt in rows[:3] if txt]
-        summary = " ".join(summary_parts).strip()
-        if not summary:
-            summary = f"วาระ {agenda_title} ไม่มีข้อมูลชัดเจน"
-        if len(summary) > 500:
-            summary = summary[:500].rstrip() + "..."
-
-        row_html: List[str] = []
-        for i, (_, detail) in enumerate(rows, start=1):
-            topic = detail[:72].rstrip()
-            if len(detail) > 72:
-                topic += "..."
-            row_html.append(
-                "<tr>"
-                f"<td>{escape(topic or f'ประเด็น {i}')}</td>"
-                f"<td>{escape(detail)}</td>"
-                "<td>ผู้เกี่ยวข้อง</td>"
-                "<td>-</td>"
-                "</tr>"
-            )
-        html = (
-            "<h4>รายละเอียดวาระ</h4>\n"
-            f"<p>{escape(summary)}</p>\n"
-            "<table>\n"
-            "<tr><th>งาน/ประเด็น</th><th>รายละเอียดเชิงข้อเท็จจริง</th><th>ผู้รับผิดชอบ</th><th>สถานะ/หมายเหตุ</th></tr>\n"
-            + "\n".join(row_html)
-            + "\n</table>"
-        )
-        return sanitize_llm_html_fragment(html).strip()
-
-    def _check_one(
-        self,
-        agenda: Any,
-        section_html: str,
-        checklist: List[str],
-        evidence_text: str,
-    ) -> Dict[str, Any]:
-        table_ok = self._has_table(section_html)
-        row_count = self._table_row_count(section_html)
-        scope = self.react._tool_check_scope(agenda, section_html, checklist)
-        completeness = self.react._tool_check_completeness(section_html, evidence_text)
-
-        evidence_plain = self._plain_text(re.sub(r"\[\s*#\d+\s*\]", " ", evidence_text))
-        section_plain = self._plain_text(re.sub(r"\[\s*#\d+\s*\]", " ", section_html))
-        evidence_numbers = set(self._extract_number_tokens(evidence_plain))
-        section_numbers = set(self._extract_number_tokens(section_plain))
-        unexpected_numbers = sorted([n for n in section_numbers if n not in evidence_numbers])
-        unexpected_ratio = (
-            float(len(unexpected_numbers)) / float(max(1, len(section_numbers)))
-            if section_numbers
-            else 0.0
-        )
-
-        pass_all = (
-            table_ok
-            and row_count >= 1
-            and scope["coverage"] >= self.min_coverage
-            and scope["off_scope_ratio"] <= self.max_offscope_ratio
-            and completeness.get("pass", True)
-            and len(unexpected_numbers) <= self.max_unexpected_numbers
-            and unexpected_ratio <= self.max_unexpected_number_ratio
-        )
-        return {
-            "pass_all": pass_all,
-            "table_ok": table_ok,
-            "row_count": row_count,
-            "scope": scope,
-            "completeness": completeness,
-            "unexpected_numbers_count": len(unexpected_numbers),
-            "unexpected_numbers_ratio": unexpected_ratio,
-            "unexpected_numbers": unexpected_numbers[:12],
-            "targets": {
-                "min_coverage": self.min_coverage,
-                "max_off_scope_ratio": self.max_offscope_ratio,
-                "max_unexpected_numbers": self.max_unexpected_numbers,
-                "max_unexpected_number_ratio": self.max_unexpected_number_ratio,
-            },
-        }
-
-    async def __call__(self, state: "MeetingState") -> "MeetingState":
-        current_loop = safe_int((state or {}).get("final_react_guard_loop"), 0) + 1
-        state["final_react_guard_loop"] = current_loop
-        if not self.enabled:
-            state["final_react_guard_reports"] = []
-            state["final_react_guard_failed_count"] = 0
-            state["final_react_guard_unresolved_failed_count"] = 0
-            state["final_react_guard_rewritten_count"] = 0
-            state["final_react_guard_needs_revision"] = False
-            return state
-
-        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
-        agendas = parsed.agendas
-        sections = state.get("agenda_sections") or []
-        if not agendas or not sections:
-            state["final_react_guard_reports"] = []
-            state["final_react_guard_failed_count"] = 0
-            state["final_react_guard_unresolved_failed_count"] = 0
-            state["final_react_guard_rewritten_count"] = 0
-            state["final_react_guard_needs_revision"] = False
-            return state
-
-        checklist_map = state.get("react_checklist_map") or self.react.compliance._extract_checklists(
-            state.get("agenda_text", ""),
-            agendas,
-        )
-
-        kg = KnowledgeGraph()
-        kg.nodes = (state.get("kg") or {}).get("nodes", {})
-        kg.edges = (state.get("kg") or {}).get("edges", [])
-        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
-        transcript_index = state.get("transcript_index") or {}
-        ocr_captures = state.get("ocr_captures") or []
-
-        sem = asyncio.Semaphore(self.max_parallel)
-
-        async def run_one(i: int, ag: Any, section_html: str) -> Tuple[int, str, Dict[str, Any], bool]:
-            async with sem:
-                no = self.react.compliance._agenda_no(ag.title, i + 1)
-                checklist = checklist_map.get(no, [])[: self.react.compliance.max_items]
-                agenda_data = kg.query_agenda(ag.title)
-                ids = self.helper._collect_evidence_ids(ag, agenda_data, transcript_index)
-                evidence_text = self.helper._build_evidence_text(transcript_index, ids)
-                ocr_lines = self.helper._collect_ocr_evidence_lines(ag, ocr_captures)
-                if ocr_lines:
-                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
-
-                current = sanitize_llm_html_fragment(str(section_html or "")).strip()
-                report = self._check_one(ag, current, checklist, evidence_text)
-                rewritten = False
-
-                if (not report["pass_all"]) and self.fallback_on_fail:
-                    current = self._build_evidence_fallback_table(ag.title, evidence_text)
-                    rewritten = True
-                    post = self._check_one(ag, current, checklist, evidence_text)
-                    report["post_pass_all"] = bool(post.get("pass_all"))
-                    report["post_unexpected_numbers_count"] = int(post.get("unexpected_numbers_count", 0))
-                    report["post_off_scope_ratio"] = float((post.get("scope") or {}).get("off_scope_ratio", 0.0))
-
-                report["index"] = i
-                report["agenda_title"] = ag.title
-                report["rewritten"] = rewritten
-                logger.info(
-                    "Final ReAct guard %d/%d pass=%s coverage=%.2f off_scope=%.2f unexpected_numbers=%d rewritten=%s",
-                    i + 1,
-                    len(agendas),
-                    report["pass_all"],
-                    float((report.get("scope") or {}).get("coverage", 0.0)),
-                    float((report.get("scope") or {}).get("off_scope_ratio", 0.0)),
-                    int(report.get("unexpected_numbers_count", 0)),
-                    rewritten,
-                )
-                return i, current, report, rewritten
-
-        checked = await asyncio.gather(
-            *[
-                run_one(i, ag, sections[i] if i < len(sections) else "")
-                for i, ag in enumerate(agendas)
-            ]
-        )
-
-        ordered = sorted(checked, key=lambda x: x[0])
-        state["agenda_sections"] = [html for _, html, _, _ in ordered]
-        reports = [report for _, _, report, _ in ordered]
-        state["final_react_guard_reports"] = reports
-        state["final_react_guard_failed_count"] = sum(1 for r in reports if not r.get("pass_all", False))
-        unresolved_failed = sum(
-            1 for r in reports if not bool(r.get("post_pass_all", r.get("pass_all", False)))
-        )
-        state["final_react_guard_unresolved_failed_count"] = unresolved_failed
-        state["final_react_guard_rewritten_count"] = sum(1 for _, _, _, rw in ordered if rw)
-        state["final_react_guard_needs_revision"] = unresolved_failed > 0
-        logger.info(
-            "Final ReAct guard done loop=%d failed=%d unresolved=%d rewritten=%d",
-            current_loop,
-            state["final_react_guard_failed_count"],
-            state["final_react_guard_unresolved_failed_count"],
-            state["final_react_guard_rewritten_count"],
-        )
-        return state
-
-
-class FinalReActReviseAgentOllama:
-    """
-    Revise node dedicated for final_react_guard failures only.
-    This avoids mixing final guard feedback with earlier react_revise feedback.
-    """
-
-    def __init__(self, client: TyphoonClient):
-        self.client = client
-        self.enabled = env_flag("FINAL_REACT_REVISE_ENABLED", True)
-        self.max_parallel = max(1, int(os.getenv("FINAL_REACT_REVISE_MAX_PARALLEL", "2")))
-        self.temperature = max(0.0, min(0.3, float(os.getenv("FINAL_REACT_REVISE_TEMPERATURE", "0.05"))))
-        self.completion_tokens = max(
-            1200,
-            stage_completion_tokens("FINAL_REACT_REVISE_COMPLETION_TOKENS", 3200),
-        )
-        self.react = ReActReflexionAgentOllama(client)
-        self.helper = self.react.gen_helper
-        self.guard_helper = FinalReActGuardAgentOllama(client)
-
-    def _clean(self, text: str) -> str:
-        return sanitize_llm_html_fragment(str(text or "")).strip()
-
-    def _build_messages(
-        self,
-        agenda_title: str,
-        checklist: List[str],
-        guard_report: Dict[str, Any],
-        section_html: str,
-        evidence_text: str,
-    ) -> List[Dict[str, str]]:
-        checklist_text = "\n".join(f"- {x}" for x in (checklist or [])) or "- ไม่มี"
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "คุณคือบรรณาธิการแก้ไขรายงานรอบสุดท้ายตาม Final Guard"
-                    " หน้าที่คือแก้เฉพาะจุดที่ไม่ผ่านจากรายงานตรวจ"
-                    " โดยยึดหลักฐานที่ให้เท่านั้น ห้ามสร้างข้อเท็จจริงใหม่"
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"""แก้ section นี้ตามผลตรวจ Final Guard
-
-วาระ: {agenda_title}
-
-CHECKLIST วาระ:
-{checklist_text}
-
-FINAL_GUARD_REPORT:
-{json.dumps(guard_report, ensure_ascii=False)}
-
-EVIDENCE:
-{evidence_text}
-
-SECTION เดิม:
-{section_html}
-
-ข้อบังคับ:
-1) ตอบเป็น HTML fragment เท่านั้น
-2) ต้องมี <table> อย่างน้อย 1 ตาราง
-3) ตารางคอลัมน์ต้องเป็น: งาน/ประเด็น | รายละเอียดเชิงข้อเท็จจริง | ผู้รับผิดชอบ | สถานะ/หมายเหตุ
-4) ห้ามใส่ตัวเลข/วันที่/เปอร์เซ็นต์ที่ไม่มีใน EVIDENCE
-5) ห้ามเติมเนื้อหานอกวาระ
-6) ห้ามใส่ citation เช่น [#123] หรือ Evidence [#123]
-7) ถ้าข้อมูลไม่พอ ให้เขียนเฉพาะที่มีหลักฐาน และใส่ "ไม่มีข้อมูลชัดเจน" เฉพาะจุดที่ไม่มีหลักฐานเท่านั้น
-""",
-            },
-        ]
-
-    async def __call__(self, state: "MeetingState") -> "MeetingState":
-        if not self.enabled:
-            state["final_react_guard_revise_count"] = 0
-            return state
-
-        parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
-        agendas = parsed.agendas
-        sections = state.get("agenda_sections") or []
-        reports = state.get("final_react_guard_reports") or []
-        if not agendas or not sections or not reports:
-            state["final_react_guard_revise_count"] = 0
-            return state
-
-        checklist_map = state.get("react_checklist_map") or self.react.compliance._extract_checklists(
-            state.get("agenda_text", ""),
-            agendas,
-        )
-
-        report_by_idx: Dict[int, Dict[str, Any]] = {}
-        for r in reports:
-            if not isinstance(r, dict):
-                continue
-            idx = safe_int(r.get("index"), -1)
-            if idx < 0:
-                continue
-            report_by_idx[idx] = r
-
-        kg = KnowledgeGraph()
-        kg.nodes = (state.get("kg") or {}).get("nodes", {})
-        kg.edges = (state.get("kg") or {}).get("edges", [])
-        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
-        transcript_index = state.get("transcript_index") or {}
-        ocr_captures = state.get("ocr_captures") or []
-
-        sem = asyncio.Semaphore(self.max_parallel)
-
-        async def revise_one(i: int, ag: Any, section_html: str) -> Tuple[int, str, bool]:
-            async with sem:
-                report = report_by_idx.get(i)
-                if not report:
-                    return i, self._clean(section_html), False
-                already_pass = bool(report.get("post_pass_all", report.get("pass_all", False)))
-                if already_pass:
-                    return i, self._clean(section_html), False
-
-                no = self.react.compliance._agenda_no(ag.title, i + 1)
-                checklist = checklist_map.get(no, [])[: self.react.compliance.max_items]
-                agenda_data = kg.query_agenda(ag.title)
-                ids = self.helper._collect_evidence_ids(ag, agenda_data, transcript_index)
-                evidence_text = self.helper._build_evidence_text(transcript_index, ids)
-                ocr_lines = self.helper._collect_ocr_evidence_lines(ag, ocr_captures)
-                if ocr_lines:
-                    evidence_text = evidence_text + "\n\nOCR EVIDENCE:\n" + "\n".join(ocr_lines)
-
-                current = self._clean(section_html)
-                messages = self._build_messages(ag.title, checklist, report, current, evidence_text)
-                try:
-                    rewritten = await self.client.generate(
-                        messages,
-                        temperature=self.temperature,
-                        completion_tokens=self.completion_tokens,
-                        auto_continue=True,
-                    )
-                    candidate = self._clean(rewritten)
-                    post = self.guard_helper._check_one(ag, candidate, checklist, evidence_text)
-                    if not bool(post.get("pass_all", False)):
-                        candidate = self.guard_helper._build_evidence_fallback_table(ag.title, evidence_text)
-                    logger.info(
-                        "Final revise %d/%d pass_after_rewrite=%s",
-                        i + 1,
-                        len(agendas),
-                        bool(post.get("pass_all", False)),
-                    )
-                    return i, self._clean(candidate), True
-                except Exception as exc:
-                    logger.warning(
-                        "Final revise %d/%d failed; fallback to evidence table: %s",
-                        i + 1,
-                        len(agendas),
-                        exc,
-                    )
-                    fallback = self.guard_helper._build_evidence_fallback_table(ag.title, evidence_text)
-                    return i, self._clean(fallback), True
-
-        revised = await asyncio.gather(
-            *[
-                revise_one(i, ag, sections[i] if i < len(sections) else "")
-                for i, ag in enumerate(agendas)
-            ]
-        )
-        ordered = sorted(revised, key=lambda x: x[0])
-        state["agenda_sections"] = [html for _, html, _ in ordered]
-        revised_count = sum(1 for _, _, changed in ordered if changed)
-        state["final_react_guard_revise_count"] = revised_count
-        logger.info("Final revise updated sections: %d", revised_count)
-        return state
-
-
-def route_final_react_guard(state: Dict[str, Any]) -> str:
-    """
-    Route after final guard:
-    - If unresolved issues remain and loop budget not exhausted -> revise
-    - Otherwise -> done (assemble)
-    """
-    unresolved = safe_int((state or {}).get("final_react_guard_unresolved_failed_count"), 0)
-    needs_revision = bool((state or {}).get("final_react_guard_needs_revision", False))
-    loop = safe_int((state or {}).get("final_react_guard_loop"), 0)
-    max_loops = max(0, int(os.getenv("FINAL_REACT_GUARD_MAX_LOOPS", "3")))
-    if (needs_revision or unresolved > 0) and loop <= max_loops:
-        return "revise"
-    return "done"
-
-
 def build_workflow() -> Any:
     client = TyphoonClient()
     graph = StateGraph(MeetingState)
@@ -2180,8 +2527,8 @@ def build_workflow() -> Any:
     graph.add_node("generate_sections", GeneratorAgentOllama(client))
     graph.add_node("validate_sections", SectionValidationAgentOllama(client))
     graph.add_node("compliance_sections", ComplianceAgentOllama(client))
+    graph.add_node("claim_verify", ClaimVerificationAgentOllama(client))
     graph.add_node("table_formatter", TableFormatterAgentOllama(client))
-    graph.add_node("final_react_guard", FinalReActGuardAgentOllama(client))
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
@@ -2191,9 +2538,9 @@ def build_workflow() -> Any:
     graph.add_edge("link_events", "generate_sections")
     graph.add_edge("generate_sections", "validate_sections")
     graph.add_edge("validate_sections", "compliance_sections")
-    graph.add_edge("compliance_sections", "table_formatter")
-    graph.add_edge("table_formatter", "final_react_guard")
-    graph.add_edge("final_react_guard", "assemble")
+    graph.add_edge("compliance_sections", "claim_verify")
+    graph.add_edge("claim_verify", "table_formatter")
+    graph.add_edge("table_formatter", "assemble")
     graph.add_edge("assemble", END)
 
     return graph.compile()
@@ -2214,9 +2561,8 @@ def build_workflow_react() -> Any:
     graph.add_node("react_critic", ReActCriticAgentOllama(client))
     graph.add_node("react_decide", ReActDecideAgent())
     graph.add_node("react_revise", ReActReviseAgentOllama(client))
-    graph.add_node("official_editor", OfficialEditorAgent(client))
+    graph.add_node("claim_verify", ClaimVerificationAgentOllama(client))
     graph.add_node("table_formatter", TableFormatterAgentOllama(client))
-    graph.add_node("final_react_guard", FinalReActGuardAgentOllama(client))
     graph.add_node("assemble", AssembleAgent())
 
     graph.set_entry_point("parse_agenda")
@@ -2234,13 +2580,12 @@ def build_workflow_react() -> Any:
         route_react_decision,
         {
             "revise": "react_revise",
-            "done": "official_editor",
+            "done": "claim_verify",
         },
     )
     graph.add_edge("react_revise", "react_critic")
-    graph.add_edge("official_editor", "table_formatter")
-    graph.add_edge("table_formatter", "final_react_guard")
-    graph.add_edge("final_react_guard", "assemble")
+    graph.add_edge("claim_verify", "table_formatter")
+    graph.add_edge("table_formatter", "assemble")
     graph.add_edge("assemble", END)
 
     return graph.compile()

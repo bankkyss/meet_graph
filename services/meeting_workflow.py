@@ -2606,13 +2606,7 @@ class GeneratorAgent:
             if self._is_text_relevant_to_agenda(f"{d.get('description', '')} {' '.join(d.get('related_topics') or [])}", q)
         ]
 
-        # fallback: ถ้าถูกกรองจนเหลือน้อยเกินไป ให้คงข้อมูลเดิมบางส่วนไว้
-        if not filtered_topics:
-            filtered_topics = topics[:8]
-        if not filtered_actions:
-            filtered_actions = actions[:10]
-        if not filtered_decisions:
-            filtered_decisions = decisions[:10]
+        # สำคัญ: ไม่เติมกลับแบบเหวี่ยงทั้งชุด เพราะทำให้เนื้อหาข้ามวาระปนเข้ามา
         return filtered_topics, filtered_actions, filtered_decisions
 
     def _is_sid_relevant(self, sid: int, transcript_index: Dict[int, str], query_tokens: set) -> bool:
@@ -2671,16 +2665,6 @@ class GeneratorAgent:
             if self._is_sid_relevant(sid, transcript_index, query_tokens):
                 out.append(sid)
                 seen.add(sid)
-
-        # if filtered too aggressively, add back original linked ids
-        min_filtered = max(4, self.min_evidence_ids // 2)
-        if len(out) < min_filtered:
-            for sid in source_unique:
-                if sid not in seen:
-                    out.append(sid)
-                    seen.add(sid)
-                if len(out) >= self.evidence_max_ids:
-                    break
 
         if len(out) < self.min_evidence_ids:
             fallback = self._fallback_ids_from_agenda(agenda, transcript_index, limit=self.fallback_evidence_topk)
@@ -2796,9 +2780,13 @@ class GeneratorAgent:
             } for a in actions][:self.max_action_rows],
         }
 
-        user = f"""สร้างโครงร่างรายงานประชุมวาระนี้ แบบทางการ กระชับ ใช้งานจริง
+        user = f"""สร้างโครงร่างรายงานประชุมวาระนี้ แบบทางการ ใช้งานจริง
+- หน้าที่คือสกัดและเรียบเรียงข้อมูล (Extract and Reconstruct) ไม่ใช่สรุปย่อ
+- ห้ามสรุปความแบบรวบยอด (Do not generalize)
 - เน้นข้อเท็จจริง ไม่เขียนเชิงวิเคราะห์ยาว
-- ถ้ามีประเด็นซ้ำให้รวมเป็นข้อเดียว
+- หากมีการพูดถึงหลายโครงการหรือหลายฝ่าย ให้แยกเป็นรายการรายโครงการ/รายฝ่ายอย่างละเอียด
+- ห้ามรวมหลายโครงการหรือหลายฝ่ายไว้ในข้อเดียว
+- ห้ามดึงประเด็นจากวาระอื่นที่ไม่อยู่ใน EVIDENCE ของวาระนี้
 - ใช้ถ้อยคำแบบรายงานประชุมองค์กร
 - จำกัดตารางติดตามไม่เกิน {self.max_followup_rows} แถว และ Action Items ไม่เกิน {self.max_action_rows} แถว
 - สำหรับตารางติดตาม แต่ละแถวต้องมี "รายละเอียดติดตาม" เป็นข้อเท็จจริง 1-2 ประโยค (ไม่ใช่แค่ชื่อหัวข้อ)
@@ -2847,6 +2835,10 @@ EVIDENCE:
   งาน | ผู้รับผิดชอบ | กำหนดการ | หมายเหตุ
 
 กติกาภาษา:
+- หน้าที่คือเรียบเรียงรายละเอียดจากหลักฐาน ไม่ใช่สรุปย่อ
+- ห้ามเขียนรวบยอด (Do not generalize)
+- ถ้าหลักฐานกล่าวถึงหลายโครงการ/หลายฝ่าย ต้องแจกแจงครบเป็นรายโครงการ/รายฝ่าย
+- ห้ามนำประเด็นจากวาระอื่นมาใส่ในวาระนี้
 - หลีกเลี่ยงคำฟุ่มเฟือย เช่น "ผลกระทบเชิงลึก", "เชิงยุทธศาสตร์", "ภาพรวมเชิงวิเคราะห์"
 - ใช้ประโยคชัดเจนและมีรายละเอียดข้อเท็จจริงของประเด็น
 - ห้ามแสดงรหัสคนพูด เช่น SPEAKER_XX ให้ใช้ "ผู้เกี่ยวข้อง" แทน
@@ -3059,6 +3051,10 @@ class SectionValidationAgent:
             short_detail = sum(1 for d in details if len(d.strip()) < self.min_followup_detail_chars)
             if short_detail > max(1, row_count // 2):
                 return True, f"followup_short_details:{short_detail}/{row_count}"
+            norm_details = [normalize_text(d) for d in details if (d or "").strip()]
+            dup_details = len(norm_details) - len(set(norm_details))
+            if dup_details >= max(2, row_count // 3):
+                return True, f"followup_duplicate_details:{dup_details}/{row_count}"
 
         return False, "ok"
 
@@ -3472,7 +3468,8 @@ SECTION เดิม:
                 current = section_html
                 for round_i in range(self.max_rewrite_rounds + 1):
                     coverage, missing = self._coverage(current, checklist)
-                    off_scope = self._off_scope_ratio(current, ag.title, checklist)
+                    agenda_scope = " ".join([ag.title] + (ag.details or []))
+                    off_scope = self._off_scope_ratio(current, agenda_scope, checklist)
                     if coverage >= self.min_coverage and off_scope <= self.max_offscope_ratio:
                         break
                     if round_i >= self.max_rewrite_rounds:
@@ -3568,7 +3565,8 @@ class ReActReflexionAgent:
         checklist: List[str],
     ) -> Dict[str, Any]:
         coverage, missing = self.compliance._coverage(section_html, checklist)
-        off_scope = self.compliance._off_scope_ratio(section_html, agenda.title, checklist)
+        agenda_scope = " ".join([agenda.title] + (agenda.details or []))
+        off_scope = self.compliance._off_scope_ratio(section_html, agenda_scope, checklist)
         return {
             "coverage": coverage,
             "missing_count": len(missing),
@@ -4115,6 +4113,9 @@ class OfficialEditorAgent:
 กติกา:
 - ใช้ภาษาเขียนทางการ ห้ามภาษาพูด เช่น ครับ/ค่ะ/เอ่อ/อ่า
 - รักษาข้อเท็จจริง ชื่อบุคคล ชื่อหน่วยงาน ชื่อโครงการ และตัวเลขให้ตรงข้อมูล
+- หน้าที่ของคุณคือจัดรูปแบบและเรียบเรียงข้อความเท่านั้น (Reformatting)
+- ห้ามสรุปความ ห้ามตัดทอนรายละเอียด ห้ามรวบยอดเนื้อหาเด็ดขาด (Do not summarize / Do not generalize)
+- ข้อมูลชื่อบุคคล ชื่อโครงการ ตัวเลขสถิติ เปอร์เซ็นต์ และปัญหาทางเทคนิคในข้อมูลดิบ ต้องคงไว้ครบถ้วนที่สุด
 - หากข้อมูลไม่ชัดเจน ให้ระบุว่า "ไม่มีข้อมูลชัดเจน" ห้ามเดา
 - ห้ามใส่ citation หรือรหัสหลักฐาน เช่น [#123], Evidence [#123], Source [#123]
 - ห้ามแสดงกระบวนการคิด และห้ามใช้ Markdown
@@ -4160,6 +4161,8 @@ Output Format (ต้องมีครบ):
 ข้อกำหนดเพิ่มเติม:
 - ทุกหัวข้อใน "ประเด็นหารือ" ควรมีรายละเอียดอย่างน้อย 1-2 ประโยค
 - ถ้ามีตัวเลข ให้คงค่าตัวเลขตามหลักฐาน
+- ห้ามสรุปแบบรวบยอด และห้ามลดจำนวนหัวข้อย่อยจากข้อมูลดิบ
+- ถ้ามีหลายโครงการหรือหลายฝ่าย ให้แจกแจงเป็นรายโครงการ/รายฝ่ายให้ครบ
 - หากไม่พบข้อมูลมติหรือ Action ให้ระบุ "ไม่มีข้อมูลชัดเจน"
 - ห้ามแสดงรหัสอ้างอิงหลักฐาน เช่น [#123] หรือ Evidence [#123] ในรายงาน
 - ห้ามลดทอนรายชื่อโครงการ/หน่วยงาน/คำเฉพาะที่มีอยู่ใน Draft Section เว้นแต่ขัดกับ Evidence โดยตรง

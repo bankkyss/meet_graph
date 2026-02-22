@@ -37,7 +37,7 @@ output/
 test_flow_output/
 test_flow_output_new/
 Meeting_Report_*.html
-
+test_flow_output_cloud/
 # Large local media/reference files
 data/*
 

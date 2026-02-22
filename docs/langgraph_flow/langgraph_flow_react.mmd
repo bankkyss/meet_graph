@@ -17,21 +17,25 @@ graph TD;
 	react_decide(react_decide)
 	react_revise(react_revise)
 	official_editor(official_editor)
+	table_formatter(table_formatter)
+	final_react_guard(final_react_guard)
 	assemble(assemble)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> parse_agenda;
 	augment_with_ocr --> extract_kg;
 	compliance_sections --> react_prepare;
 	extract_kg --> link_events;
+	final_react_guard --> assemble;
 	generate_sections --> validate_sections;
 	link_events --> generate_sections;
-	official_editor --> assemble;
+	official_editor --> table_formatter;
 	parse_agenda --> augment_with_ocr;
 	react_critic --> react_decide;
 	react_decide -. &nbsp;done&nbsp; .-> official_editor;
 	react_decide -. &nbsp;revise&nbsp; .-> react_revise;
 	react_prepare --> react_critic;
 	react_revise --> react_critic;
+	table_formatter --> final_react_guard;
 	validate_sections --> compliance_sections;
 	assemble --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
