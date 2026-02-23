@@ -207,8 +207,7 @@ def pick_frame_points(parsed_agenda: Any, transcript_model: Any) -> List[FramePo
                 best_hits = hits[:6]
                 best_evidence = seg_text.strip()
 
-        if len(best_evidence) > 180:
-            best_evidence = best_evidence[:180].rstrip() + "..."
+    
 
         points.append(
             FramePoint(
@@ -426,8 +425,7 @@ def collect_evidence_lines_for_agenda(agenda: Any, transcript_model: Any, top_k:
         start = safe_float(getattr(seg, "start", 0.0), 0.0)
         speaker = str(getattr(seg, "speaker", "Unknown") or "Unknown")
         text = str(getattr(seg, "text", "") or "").strip()
-        if len(text) > 280:
-            text = text[:280].rstrip() + "..."
+    
         lines.append(f"[{format_hms(start)}] {speaker}: {text}")
     return lines
 

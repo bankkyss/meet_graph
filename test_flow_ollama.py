@@ -207,8 +207,7 @@ def pick_frame_points(parsed_agenda: Any, transcript_model: Any) -> List[FramePo
                 best_hits = hits[:6]
                 best_evidence = seg_text.strip()
 
-        if len(best_evidence) > 180:
-            best_evidence = best_evidence[:180].rstrip() + "..."
+
 
         points.append(
             FramePoint(
@@ -426,8 +425,7 @@ def collect_evidence_lines_for_agenda(agenda: Any, transcript_model: Any, top_k:
         start = safe_float(getattr(seg, "start", 0.0), 0.0)
         speaker = str(getattr(seg, "speaker", "Unknown") or "Unknown")
         text = str(getattr(seg, "text", "") or "").strip()
-        if len(text) > 280:
-            text = text[:280].rstrip() + "..."
+
         lines.append(f"[{format_hms(start)}] {speaker}: {text}")
     return lines
 
@@ -552,7 +550,7 @@ async def rewrite_sections_official_async(
     config: Dict[str, Any],
     completion_tokens: int = 6400,
 ) -> Tuple[str, int]:
-    from services.meeting_workflow_ollama import TyphoonClient
+    from services.lite_workflow.meeting_workflow_ollama import TyphoonClient
 
     agendas = list(parsed.agendas)
     blocks = extract_agenda_blocks(final_html, agendas)
@@ -644,13 +642,13 @@ def run_react_workflow(
     resume_kg_raw: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Any, Any, Dict[str, Any]]:
     try:
-        from services.meeting_workflow import (
+        from services.lite_workflow.meeting_workflow import (
             ParsedAgenda,
             TranscriptJSON,
             build_transcript_index,
             route_react_decision,
         )
-        from services.meeting_workflow_ollama import (
+        from services.lite_workflow.meeting_workflow_ollama import (
             WORKFLOW_REACT,
             TyphoonClient,
             AgendaParserAgentOllama,
@@ -658,15 +656,10 @@ def run_react_workflow(
             GeneratorAgentOllama,
             SectionValidationAgentOllama,
             ComplianceAgentOllama,
-            ReActPrepareAgentOllama,
-            ReActCriticAgentOllama,
-            ReActDecideAgent,
-            ReActReviseAgentOllama,
             OfficialEditorAgent,
             TableFormatterAgentOllama,
             FinalReActGuardAgentOllama,
             AssembleAgent,
-            route_final_react_guard,
         )
     except Exception as e:
         raise RuntimeError(
@@ -737,10 +730,6 @@ def run_react_workflow(
         generate_sections = GeneratorAgentOllama(client)
         validate_sections = SectionValidationAgentOllama(client)
         compliance_sections = ComplianceAgentOllama(client)
-        react_prepare = ReActPrepareAgentOllama(client)
-        react_critic = ReActCriticAgentOllama(client)
-        react_decide = ReActDecideAgent()
-        react_revise = ReActReviseAgentOllama(client)
         official_editor = OfficialEditorAgent(client)
         table_formatter = TableFormatterAgentOllama(client)
         final_react_guard = FinalReActGuardAgentOllama(client)
@@ -759,30 +748,9 @@ def run_react_workflow(
         state = await _call_node("generate_sections", generate_sections, state)
         state = await _call_node("validate_sections", validate_sections, state)
         state = await _call_node("compliance_sections", compliance_sections, state)
-        state = await _call_node("react_prepare", react_prepare, state)
-
-        react_guard = 0
-        while True:
-            state = await _call_node("react_critic", react_critic, state)
-            state = await _call_node("react_decide", react_decide, state)
-            route = route_react_decision(state)
-            print(f"[route] react_decide -> {route}", flush=True)
-            if route == "revise":
-                state = await _call_node("react_revise", react_revise, state)
-                react_guard += 1
-                if react_guard > max(4, int(state.get("react_max_loops", 2)) + 2):
-                    print("[warn] react revise guard hit; continue to official_editor", flush=True)
-                    break
-                continue
-
-            state = await _call_node("official_editor", official_editor, state)
-            state = await _call_node("table_formatter", table_formatter, state)
-            state = await _call_node("final_react_guard", final_react_guard, state)
-            final_route = route_final_react_guard(state)
-            print(f"[route] final_react_guard -> {final_route}", flush=True)
-            if final_route == "revise":
-                print("[warn] final_react_guard requested revise but final_revise is disabled; continue to assemble", flush=True)
-            break
+        state = await _call_node("official_editor", official_editor, state)
+        state = await _call_node("table_formatter", table_formatter, state)
+        state = await _call_node("final_react_guard", final_react_guard, state)
 
         state = await _call_node("assemble", assemble, state)
         return state

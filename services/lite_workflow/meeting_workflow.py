@@ -1652,145 +1652,6 @@ Output JSON:
         return try_parse_json(resp)
 
 
-class TranscriptPolishAgent:
-    """แปลงภาษาพูดในทุก transcript segment ให้เป็นภาษาเขียนทางการ"""
-    
-    SYSTEM = """คุณคือผู้เชี่ยวชาญแปลงภาษาพูดไทยเป็นภาษาเขียนทางการ
-กติกา:
-- เปลี่ยนภาษาพูดเป็นภาษาเขียนทางการ เช่น "ตอนนี้" -> "ปัจจุบัน", "เยอะ" -> "จำนวนมาก"
-- ตัดคำติดปาก: เอ่อ / อ้า / นะคะ / นะครับ / จริงๆ / อ่ะ / เนาะ / อย่างงี้ / คือ / แบบว่า
-- ตัดคำซ้ำซากที่เกิดจากการพูดลังเล ไม่ว่าจะซ้ำกี่ครั้งก็ตาม เช่น "จริง จริง" -> "จริง", "จริง จริง จริง" -> "จริง", "ที่ ที่ ที่" -> "ที่", "เห็น เห็น เห็น เห็น" -> "เห็น"\n- กติกา: คำใดก็ตามที่ปรากฏซ้ำกันติดต่อกัน ให้เหลือแค่ครั้งเดียว
-- รักษาตัวเลข ชื่อโครงการ ชื่อบุคคล และข้อเท็จจริงไว้ทุกอย่าง
-- ตอบเฉพาะ JSON object เท่านั้น ไม่อธิบาย"""
-
-    def __init__(self, client: TyphoonClient):
-        self.client = client
-        self.enabled = env_flag("TRANSCRIPT_POLISH_ENABLED", True)
-
-    async def __call__(self, state: "MeetingState") -> "MeetingState":
-        if not self.enabled:
-            return state
-            
-        transcript_data = state.get("transcript_json")
-        if not transcript_data:
-            return state
-            
-        transcript = TranscriptJSON.model_validate(transcript_data)
-        if not transcript.segments:
-            return state
-            
-        # batch เป็น chunk ละ 20 segments (เฉพาะที่ไม่ใช่ OCR)
-        BATCH = 20
-        polished_segments = []
-        
-        # จัดการแยกเก็บ OCR segments ไว้เติมทีหลังถ้ามี
-        to_polish: List[TranscriptSegment] = []
-        for seg in transcript.segments:
-            speaker_lower = (seg.speaker or "").lower()
-            source_lower = (seg.source or "").lower()
-            if "ocr" in speaker_lower or "ocr" in source_lower:
-                polished_segments.append(seg) # ข้ามไปเลย
-            else:
-                to_polish.append(seg)
-        
-        for i in range(0, len(to_polish), BATCH):
-            batch = to_polish[i:i+BATCH]
-            polished_batch = await self._polish_batch(batch, batch_label=f"{i//BATCH}")
-            polished_segments.extend(polished_batch)
-
-        # Sort กลับตาม start time หลังจากเอามารวมกัน
-        polished_segments.sort(key=lambda s: float(s.start) if isinstance(s.start, (int, float)) else 0.0)
-        new_transcript = TranscriptJSON(segments=polished_segments)
-        state["transcript_json"] = new_transcript.model_dump()
-        state["transcript_index"] = build_transcript_index(new_transcript)
-        return state
-
-    async def _polish_batch(self, batch: List[TranscriptSegment], batch_label: str = "") -> List[TranscriptSegment]:
-        if not batch:
-            return batch
-
-        # format "[idx] text" to map exactly to the JSON output keys
-        lines = [f"[{j}] {str(seg.text or '').strip()}" for j, seg in enumerate(batch)]
-        
-        messages = [
-            {"role": "system", "content": self.SYSTEM},
-            {"role": "user", "content": 
-             "แปลงทุกบรรทัดนี้เป็นภาษาเขียน ตอบเป็น JSON object เท่านั้น\n"
-             "โดยใช้ตัวเลขในวงเล็บเป็น key และข้อความที่แปลงแล้วเป็น value\n"
-             "ตัวอย่าง: {\"0\": \"ข้อความ 1\", \"1\": \"ข้อความ 2\"}\n\n" + 
-             "\n".join(lines)}
-        ]
-        
-        try:
-            resp = await self.client.generate(
-                messages, 
-                temperature=0.1, 
-                completion_tokens=stage_completion_tokens("TRANSCRIPT_POLISH_COMPLETION_TOKENS", 2500)
-            )
-            cleaned = try_parse_json(resp)
-            
-            if isinstance(cleaned, dict):
-                parsed_count = 0
-                result = []
-                for j, seg in enumerate(batch):
-                    new_seg = seg.model_copy()
-                    new_text = cleaned.get(str(j))
-                    if new_text:
-                        cleaned_txt = str(new_text).strip()
-                        if len(cleaned_txt) >= 2:
-                            new_seg.text = cleaned_txt
-                            parsed_count += 1
-                    result.append(new_seg)
-                logger.info("TranscriptPolish batch %s: polished %d/%d items", batch_label, parsed_count, len(batch))
-                return result
-                
-            elif isinstance(cleaned, list):
-                result = []
-                matched = min(len(cleaned), len(batch))
-                for j in range(matched):
-                    new_seg = batch[j].model_copy()
-                    new_text = cleaned[j]
-                    if new_text:
-                        cleaned_txt = str(new_text).strip()
-                        if len(cleaned_txt) >= 2:
-                            new_seg.text = cleaned_txt
-                    result.append(new_seg)
-                
-                # Append the rest that were not matched
-                for j in range(matched, len(batch)):
-                    result.append(batch[j].model_copy())
-                    
-                logger.warning(
-                    "TranscriptPolish batch %s: format list mismatch (expected %d items, got %d). Fallback to partial.",
-                    batch_label, len(batch), len(cleaned)
-                )
-                return result
-                
-            else:
-                logger.warning(
-                    "TranscriptPolish batch %s: format mismatch (expected dict, got %s).",
-                    batch_label, type(cleaned)
-                )
-        except Exception as exc:
-            logger.warning("TranscriptPolish batch %s failed (%s); splitting and retrying...", batch_label, exc)
-
-        # Fallback: Split batch in half and retry if batch size > 1
-        if len(batch) > 1:
-            mid = len(batch) // 2
-            logger.info("TranscriptPolish batch %s: Splitting batch of size %d into %d and %d", batch_label, len(batch), mid, len(batch) - mid)
-            left = await self._polish_batch(batch[:mid], batch_label=f"{batch_label}a")
-            right = await self._polish_batch(batch[mid:], batch_label=f"{batch_label}b")
-            return left + right
-        else:
-            logger.warning("TranscriptPolish batch %s: cannot split single item; fallback to raw.", batch_label)
-            return list(batch)
-        
-        # Sort กลับตาม start time หลังจากเอามารวมกัน
-        polished_segments.sort(key=lambda s: float(s.start) if isinstance(s.start, (int, float)) else 0.0)
-        new_transcript = TranscriptJSON(segments=polished_segments)
-        state["transcript_json"] = new_transcript.model_dump()
-        state["transcript_index"] = build_transcript_index(new_transcript)
-        return state
 
 
 class OcrAugmentAgent:
@@ -2078,6 +1939,138 @@ class OcrAugmentAgent:
         return state
 
 
+class TranscriptPolishAgent:
+    """
+    Converts spoken-Thai transcript segments to formal written Thai
+    before they reach ExtractorAgent, preventing spoken language from
+    being permanently embedded in the KnowledgeGraph.
+    Processes segments in batches. Falls back to originals on LLM error.
+    """
+
+    SYSTEM_PROMPT = """คุณคือผู้เชี่ยวชาญแปลงบันทึกการประชุมจากภาษาพูดไทยให้เป็นภาษาเขียนทางการ
+
+กติกาบังคับ:
+- แปลงภาษาพูดเป็นภาษาเขียนทางการ เช่น "ตอนนี้" → "ปัจจุบัน", "เยอะ" → "จำนวนมาก", "ได้เลย" → "ดำเนินการได้ทันที"
+- ตัดคำติดปากออกทั้งหมด: เอ่อ / อ้า / อ่า / นะครับ / นะคะ / ครับ / ค่ะ / เนาะ / นะ / อ่ะ / จริงๆ / อ่ะนะ
+- ตัดคำซ้ำซากที่เกิดจากการพูดลังเล ไม่ว่าจะซ้ำกี่ครั้งก็ตาม เช่น "จริง จริง" -> "จริง", "จริง จริง จริง" -> "จริง", "ที่ ที่ ที่" -> "ที่", "เห็น เห็น เห็น เห็น" -> "เห็น"\n- กติกา: คำใดก็ตามที่ปรากฏซ้ำกันติดต่อกัน ให้เหลือแค่ครั้งเดียว
+- แก้คำย่อที่ไม่เป็นทางการเฉพาะที่ชัดเจนจากบริบท เช่น "งบ" → "งบประมาณ"
+- รักษาตัวเลข เปอร์เซ็นต์ ชื่อโครงการ ชื่อหน่วยงาน ชื่อบุคคล รหัสต่างๆ ให้ครบถ้วนและถูกต้องทุกตัว
+- ถ้าประโยคไม่ชัดเจนหรือวัดความหมายไม่ได้ ให้คงข้อความเดิมไว้
+- ห้ามเพิ่มข้อมูล สรุปความ หรือตีความเกินกว่าที่พูดในต้นฉบับ
+- ตอบเฉพาะ JSON object เท่านั้น ไม่มีคำอธิบายใดๆ นอก JSON"""
+
+    def __init__(self, client: "TyphoonClient"):
+        self.client = client
+        self.batch_size = int(os.getenv("POLISH_BATCH_SIZE", "20"))
+        self.enabled = os.getenv("TRANSCRIPT_POLISH_ENABLED", "1").lower() not in ("0", "false", "no")
+        self.completion_tokens = stage_completion_tokens("POLISH_COMPLETION_TOKENS", 2400)
+
+    async def _polish_batch(self, batch: List[TranscriptSegment], batch_label: str = "") -> List[TranscriptSegment]:
+        if not batch:
+            return batch
+        # Skip OCR segments — they are already structured text
+        non_ocr_indices = [i for i, seg in enumerate(batch)
+                           if str(seg.speaker or "").upper() not in ("OCR", "SCREEN")]
+        if not non_ocr_indices:
+            return batch
+
+        lines = [f"[{i}] {(batch[i].text or '').strip()}" for i in non_ocr_indices]
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "แปลงทุกบรรทัดด้านล่างจากภาษาพูดเป็นภาษาเขียนทางการ\n"
+                    "ตอบเป็น JSON object เท่านั้น โดย key เป็นตัวเลขในวงเล็บและ value เป็นข้อความที่แปลงแล้ว\n"
+                    "ตัวอย่าง: {\"0\": \"ข้อความ 1\", \"1\": \"ข้อความ 2\"}\n"
+                    f"ต้องมีครบ {len(non_ocr_indices)} keys ตามลำดับ\n\n"
+                    + "\n".join(lines)
+                ),
+            },
+        ]
+        try:
+            resp = await self.client.generate(messages, temperature=0.05, completion_tokens=self.completion_tokens)
+            cleaned = try_parse_json(resp)
+            
+            if isinstance(cleaned, dict):
+                result = list(batch)
+                parsed_count = 0
+                for list_pos, seg_idx in enumerate(non_ocr_indices):
+                    new_text = cleaned.get(str(seg_idx))
+                    if new_text is None:
+                        new_text = cleaned.get(str(list_pos))
+                    
+                    if not new_text:
+                        new_text = batch[seg_idx].text or ""
+                    else:
+                        new_text = str(new_text).strip()
+                        if len(new_text) < 3 and len(batch[seg_idx].text or "") >= 3:
+                            new_text = batch[seg_idx].text or ""
+                        else:
+                            parsed_count += 1
+                            
+                    result[seg_idx] = batch[seg_idx].model_copy(update={"text": new_text})
+                
+                logger.info("TranscriptPolish batch %s: polished %d/%d segments", batch_label, parsed_count, len(non_ocr_indices))
+                return result
+                
+            elif isinstance(cleaned, list):
+                result = list(batch)
+                matched = min(len(cleaned), len(non_ocr_indices))
+                for list_pos in range(matched):
+                    seg_idx = non_ocr_indices[list_pos]
+                    new_text = str(cleaned[list_pos]).strip() if cleaned[list_pos] else (batch[seg_idx].text or "")
+                    if len(new_text) < 3 and len(batch[seg_idx].text or "") >= 3:
+                        new_text = batch[seg_idx].text or ""
+                    result[seg_idx] = batch[seg_idx].model_copy(update={"text": new_text})
+                
+                if len(cleaned) != len(non_ocr_indices):
+                    logger.warning("TranscriptPolish batch %s: length mismatch (%d vs %d), applied partial", batch_label, len(cleaned), len(non_ocr_indices))
+                else:
+                    logger.info("TranscriptPolish batch %s: polished %d segments", batch_label, len(non_ocr_indices))
+                return result
+                
+            else:
+                logger.warning("TranscriptPolish batch %s: invalid JSON format; fallback", batch_label)
+        except Exception as exc:
+            logger.warning("TranscriptPolish batch %s failed (%s); splitting and retrying...", batch_label, exc)
+
+        # Fallback: Split batch in half and retry if batch size > 1
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            logger.info("TranscriptPolish batch %s: Splitting batch of size %d into %d and %d", batch_label, len(batch), mid, len(batch) - mid)
+            left = await self._polish_batch(batch[:mid], batch_label=f"{batch_label}a")
+            right = await self._polish_batch(batch[mid:], batch_label=f"{batch_label}b")
+            return left + right
+        else:
+            logger.warning("TranscriptPolish batch %s: cannot split single item; fallback to raw.", batch_label)
+            return list(batch)
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        if not self.enabled:
+            logger.info("TranscriptPolishAgent disabled; skipping")
+            return state
+        transcript = TranscriptJSON.model_validate(state["transcript_json"])
+        segments = list(transcript.segments)
+        if not segments:
+            return state
+
+        batch_size = max(1, self.batch_size)
+        num_batches = math.ceil(len(segments) / batch_size)
+        logger.info("TranscriptPolishAgent: %d segments, %d batches", len(segments), num_batches)
+
+        polished: List[TranscriptSegment] = []
+        for i in range(0, len(segments), batch_size):
+            label = f"{i // batch_size + 1}/{num_batches}"
+            polished.extend(await self._polish_batch(segments[i:i + batch_size], batch_label=label))
+
+        new_transcript = TranscriptJSON(segments=polished)
+        state["transcript_json"] = new_transcript.model_dump()
+        state["transcript_index"] = build_transcript_index(new_transcript)
+        logger.info("TranscriptPolishAgent: done — %d segments", len(polished))
+        return state
+
+
 class ExtractorAgent:
     """
     Extract เป็น chunk เพื่อคุม token แต่ยัง “ละเอียด” ได้โดย:
@@ -2086,7 +2079,7 @@ class ExtractorAgent:
     """
     def __init__(self, client: TyphoonClient):
         self.client = client
-        self.system_prompt = """คุณคือ AI วิเคราะห์ transcript
+        self.system_prompt = """คุณคือ AI วิเคราะห์ transcript การประชุม
 ต้องตอบเป็น JSON เท่านั้น:
 {
   "mentioned_names": ["ชื่อบุคคลที่ถูกอ้างถึงในวงสนทนา (ถ้ามี)"],
@@ -2095,12 +2088,13 @@ class ExtractorAgent:
   "actions":[{"description":"...","assignee":"...","deadline":"...","related_topics":["..."],"evidence":"...","segment_ids":[..]}],
   "decisions":[{"description":"...","related_topics":["..."],"evidence":"...","segment_ids":[..]}]
 }
-กติกา:
+กติกาบังคับ:
 - topic.details และ description ต้องเขียนเป็นภาษาเขียนทางการเท่านั้น ห้ามภาษาพูด
-- ห้าม copy-paste ประโยค transcript ดิบลงใน details/description
-- ตัดคำว่า ครับ ค่ะ เอ่อ อ้า นะ เนาะ ออกทั้งหมด
-- evidence ให้เขียนสรุปใจความ ไม่ใช่คัดลอก
-- evidence field ต้องเป็นภาษาเขียนทางการ ให้สรุปใจความ ห้าม copy-paste คำพูดดิบจาก transcript
+- ห้าม copy-paste ข้อความ transcript ดิบลงใน details หรือ description โดยตรง ให้สรุปและเรียบเรียงใหม่
+- ห้ามมีคำ ครับ / ค่ะ / เอ่อ / อ้า / เนาะ / นะ ใน output ทุก field
+- topic.details ให้เขียนสรุปเชิงเนื้อหาแบบ "ยังคงรายละเอียด" ไม่ใช่ 1 บรรทัด
+- evidence ให้เขียนใจความสรุปที่สะท้อนข้อเท็จจริงจาก transcript ไม่ใช่คัดลอกคำพูดดิบ
+- รักษาตัวเลข ชื่อโครงการ ชื่อหน่วยงาน ชื่อบุคคล ให้ครบถ้วนและถูกต้อง
 """
 
     def _chunk_segments(self, segments: List[TranscriptSegment], max_segments: int, overlap: int) -> List[List[Tuple[int, TranscriptSegment]]]:
@@ -2906,11 +2900,9 @@ class GeneratorAgent:
         return out[: self.evidence_max_ids]
 
     def _build_evidence_text(self, transcript_index: Dict[int, str], ids: List[int]) -> str:
-        _FILLER = re.compile(
-            r'(?<!\w)(เอ่อ|อ้า|อ่า|เนาะ|นะครับ|นะคะ|ครับ|ค่ะ|อ่ะนะ|แบบว่า|คือว่า)(?!\w)'
-        )
         out_lines = []
         used = 0
+        FILLER = re.compile(r'\b(เอ่อ|อ้า|เนาะ|นะคะ|นะครับ|ครับ|ค่ะ|อ่ะนะ)\b')
         for sid in ids:
             line = transcript_index.get(sid, "")
             if not line:
@@ -2918,12 +2910,8 @@ class GeneratorAgent:
             line = line.strip()
             if not line:
                 continue
-            # ── strip filler words that survived polish fallback ──
-            line = _FILLER.sub('', line)
-            line = re.sub(r'\s{2,}', ' ', line).strip()
-            if not line:
-                continue
-            # ─────────────────────────────────────────────────────
+            # Strip spoken language filler
+            line = FILLER.sub('', line).strip()
             row = f"[#{sid}] {line}"
             if used + len(row) + 1 > self.evidence_max_chars:
                 break
@@ -2998,6 +2986,7 @@ class GeneratorAgent:
         evidence_text: str,
     ) -> List[Dict[str, str]]:
         topics, actions, decisions = self._filter_agenda_data_for_scope(agenda, agenda_data)
+
         compact = {
             "agenda_title": agenda.title,
             "agenda_scope": agenda.details,
@@ -3018,6 +3007,7 @@ class GeneratorAgent:
                 for a in actions
             ][:self.max_action_rows],
         }
+
         user = f"""เขียนบันทึกการประชุมวาระต่อไปนี้เป็นร้อยแก้วภาษาราชการ
 
 วาระ: {agenda.title}
@@ -3033,20 +3023,17 @@ class GeneratorAgent:
 - ระบุชื่อผู้รับผิดชอบและกำหนดการให้ชัดเจนในเนื้อหา
 - ถ้ามีหลายโครงการหรือหลายฝ่าย ให้เขียนแยกแต่ละรายการอย่างละเอียด
 - ห้ามสรุปรวบยอด ต้องบรรยายครบทุกประเด็น
-- ห้ามมี table, bullet, JSON ในผลลัพธ์"""
+- ห้ามมี table, bullet, หรือ JSON ในผลลัพธ์"""
+
         return [
             {"role": "system", "content": self.narrative_system},
             {"role": "user", "content": user},
         ]
 
-    def _build_extraction_prompt(
-        self,
-        narrative: str,
-        agenda_title: str,
-    ) -> List[Dict[str, str]]:
+    def _build_extraction_prompt(self, narrative: str, agenda_title: str) -> List[Dict[str, str]]:
         user = f"""ดึงข้อมูลจากบันทึกการประชุมด้านล่างให้เป็น JSON ตาม schema นี้:
 {{
-  "summary_points": ["ประเด็นสำคัญ 1", "ประเด็นสำคัญ 2"],
+  "summary_points": ["ประเด็นสำคัญ 1", "ประเด็นสำคัญ 2", ...],
   "followup_rows": [
     {{"department": "ชื่อฝ่าย", "topic": "หัวข้อติดตาม", "detail": "รายละเอียด 1-2 ประโยค", "note": "ติดตาม/แล้วเสร็จ/รอข้อมูล"}}
   ],
@@ -3068,24 +3055,22 @@ class GeneratorAgent:
 
 NARRATIVE:
 {narrative}"""
+
         return [
             {"role": "system", "content": self.extractor_system},
             {"role": "user", "content": user},
         ]
 
-    def _render_html(self, structure: Dict[str, Any]) -> str:
-        """แปลง structured JSON เป็น HTML fragment ด้วย Python ล้วนๆ
-        LLM ไม่ได้แตะ HTML เลย ภาษาพูดไม่มีทางรั่วเข้า table"""
+    def _render_html(self, structure: Dict[str, Any], agenda_title: str) -> str:
+        """แปลง structured JSON เป็น HTML fragment โดยใช้ Python ล้วนๆ ไม่ใช้ LLM"""
+        import html as html_lib
         parts: List[str] = []
 
         # ── สรุปประเด็น ──────────────────────────────────────────────────
         parts.append("<h4>สรุปประเด็น</h4>")
         points = structure.get("summary_points") or []
         if points:
-            items = "".join(
-                f"<li>{html_lib.escape(str(p))}</li>"
-                for p in points if str(p).strip()
-            )
+            items = "".join(f"<li>{html_lib.escape(str(p))}</li>" for p in points if str(p).strip())
             parts.append(f"<ul>{items}</ul>")
         else:
             parts.append("<ul><li>ไม่มีข้อมูลชัดเจน</li></ul>")
@@ -3100,15 +3085,12 @@ NARRATIVE:
                 topic  = html_lib.escape(str(row.get("topic") or "-"))
                 detail = html_lib.escape(str(row.get("detail") or "ไม่มีข้อมูลชัดเจน"))
                 note   = html_lib.escape(str(row.get("note") or "-"))
-                rows += (
-                    f"<tr><td>{dept}</td><td>{topic}</td>"
-                    f"<td>{detail}</td><td>{note}</td></tr>"
-                )
+                rows += f"<tr><td>{dept}</td><td>{topic}</td><td>{detail}</td><td>{note}</td></tr>"
             parts.append(
                 "<table><thead><tr>"
                 "<th>รายชื่อฝ่าย</th><th>หัวข้อติดตาม</th>"
                 "<th>รายละเอียดติดตาม</th><th>หมายเหตุ</th>"
-                f"</tr></thead><tbody>{rows}</tbody></table>"
+                f"</tr></thead><tbody>{{rows}}</tbody></table>"
             )
         else:
             parts.append("<p>ไม่มีข้อมูลชัดเจน</p>")
@@ -3118,10 +3100,10 @@ NARRATIVE:
         decisions = structure.get("decisions") or []
         if decisions:
             items = "".join(
-                f"<li>{html_lib.escape(str(d.get('text', '') if isinstance(d, dict) else d))}</li>"
+                f"<li>{{html_lib.escape(str(d.get('text') or d if isinstance(d, str) else ''))}}</li>"
                 for d in decisions if d
             )
-            parts.append(f"<ul>{items}</ul>")
+            parts.append(f"<ul>{{items}}</ul>")
         else:
             parts.append("<ul><li>ไม่มีข้อมูลชัดเจน</li></ul>")
 
@@ -3135,20 +3117,17 @@ NARRATIVE:
                 owner = html_lib.escape(str(a.get("owner") or "ผู้เกี่ยวข้อง"))
                 due   = html_lib.escape(str(a.get("due") or "ไม่ระบุ"))
                 note  = html_lib.escape(str(a.get("note") or "-"))
-                rows += (
-                    f"<tr><td>{task}</td><td>{owner}</td>"
-                    f"<td>{due}</td><td>{note}</td></tr>"
-                )
+                rows += f"<tr><td>{{task}}</td><td>{{owner}}</td><td>{{due}}</td><td>{{note}}</td></tr>"
             parts.append(
                 "<table><thead><tr>"
                 "<th>งาน</th><th>ผู้รับผิดชอบ</th>"
                 "<th>กำหนดการ</th><th>หมายเหตุ</th>"
-                f"</tr></thead><tbody>{rows}</tbody></table>"
+                f"</tr></thead><tbody>{{rows}}</tbody></table>"
             )
         else:
             parts.append("<p>ไม่มีข้อมูลชัดเจน</p>")
 
-        return "\n".join(parts)
+        return "\\n".join(parts)
 
     async def _generate_narrative(
         self,
@@ -3165,24 +3144,9 @@ NARRATIVE:
         )
         return (resp or "").strip()
 
-    async def _extract_structure(
-        self,
-        narrative: str,
-        agenda_title: str,
-    ) -> Dict[str, Any]:
-        _FALLBACK = {
-            "summary_points": [f"สรุปวาระ {agenda_title}", "ไม่มีข้อมูลชัดเจนเพิ่มเติม"],
-            "followup_rows": [{
-                "department": "ผู้เกี่ยวข้อง",
-                "topic": "ติดตามประเด็นตามวาระ",
-                "detail": "ยังไม่มีข้อมูลชัดเจนเชิงรายละเอียดจากหลักฐานในรอบนี้",
-                "note": "ติดตาม",
-            }],
-            "decisions": [],
-            "actions": [],
-        }
-        if not (narrative or "").strip():
-            return _FALLBACK
+    async def _extract_structure(self, narrative: str, agenda_title: str) -> Dict[str, Any]:
+        if not narrative.strip():
+            return {"summary_points": [], "followup_rows": [], "decisions": [], "actions": []}
 
         messages = self._build_extraction_prompt(narrative, agenda_title)
         resp = await self.client.generate(
@@ -3192,137 +3156,20 @@ NARRATIVE:
         )
         data = try_parse_json(resp)
         if not data:
-            repair = [
-                {
-                    "role": "system",
-                    "content": "แก้ JSON ให้ถูกต้องตาม schema ตอบเป็น JSON เท่านั้น",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "แก้ให้เป็น JSON ที่ถูกต้องตาม schema "
-                        "summary_points/followup_rows/decisions/actions\n"
-                        f"RAW:\n{resp}"
-                    ),
-                },
+            # repair pass
+            repair_messages = [
+                {"role": "system", "content": "แก้ JSON ให้ถูกต้องตาม schema ตอบเป็น JSON เท่านั้น"},
+                {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema summary_points/followup_rows/decisions/actions\nRAW:\n{resp}"},
             ]
             resp2 = await self.client.generate(
-                repair,
+                repair_messages,
                 temperature=0.0,
                 completion_tokens=stage_completion_tokens("GEN_EXTRACT_REPAIR_COMPLETION_TOKENS", 800),
             )
             data = try_parse_json(resp2)
-        return data if data else _FALLBACK
-
-    # DEPRECATED — replaced by two-stage generation (Phase 6B)
-    def _build_outline_prompt(
-        self,
-        agenda: AgendaItem,
-        agenda_data: Dict[str, Any],
-        evidence_text: str,
-    ) -> List[Dict[str, str]]:
-        topics, actions, decisions = self._filter_agenda_data_for_scope(agenda, agenda_data)
-
-        compact = {
-            "agenda_title": agenda.title,
-            "agenda_scope": agenda.details,
-            "topics": [{"title": t.get("title"), "details": (t.get("details") or "")[:450]} for t in topics][:self.max_followup_rows],
-            "decisions": [{"description": (d.get("description") or "")[:240]} for d in decisions][:self.max_action_rows],
-            "actions": [{
-                "description": (a.get("description") or "")[:240],
-                "assignee": self._normalize_owner(a.get("assignee")),
-                "deadline": a.get("deadline") or "ไม่ระบุ",
-            } for a in actions][:self.max_action_rows],
-        }
-
-        user = f"""สร้างโครงร่างรายงานประชุมวาระนี้ แบบทางการ ใช้งานจริง
-- หน้าที่คือสกัดและเรียบเรียงข้อมูล (Extract and Reconstruct) ไม่ใช่สรุปย่อ
-- ห้ามสรุปความแบบรวบยอด (Do not generalize)
-- เน้นข้อเท็จจริง ไม่เขียนเชิงวิเคราะห์ยาว
-- หากมีการพูดถึงหลายโครงการหรือหลายฝ่าย ให้แยกเป็นรายการรายโครงการ/รายฝ่ายอย่างละเอียด
-- ห้ามรวมหลายโครงการหรือหลายฝ่ายไว้ในข้อเดียว
-- ห้ามดึงประเด็นจากวาระอื่นที่ไม่อยู่ใน EVIDENCE ของวาระนี้
-- ใช้ถ้อยคำแบบรายงานประชุมองค์กร
-- จำกัดตารางติดตามไม่เกิน {self.max_followup_rows} แถว และ Action Items ไม่เกิน {self.max_action_rows} แถว
-- ห้ามคัดลอกคำเตือน แหล่งที่มา หรือคำย่อของระบบ เช่น "อ้างอิงจากหน้าจอเวลา" ลงในโครงร่าง (ให้สรุปเอาแต่เนื้อหา)
-- สำหรับตารางติดตาม แต่ละแถวต้องมี "รายละเอียดติดตาม" เป็นข้อเท็จจริง 1-2 ประโยค (ไม่ใช่แค่ชื่อหัวข้อ)
-- ห้ามเดา
-
-ข้อมูลประกอบ (ย่อ):
-{json.dumps(compact, ensure_ascii=False)}
-
-EVIDENCE (อ้างได้ด้วย [#id]):
-{evidence_text}
-
-Output JSON schema:
-{{
-  "summary_points":["...","..."],
-  "followup_rows":[
-    {{"department":"...","topic":"...","detail":"...", "note":"ติดตาม/รอข้อมูล/แล้วเสร็จ"}}
-  ],
-  "decisions":[{{"text":"...","evidence_ids":[...]}}],
-  "actions":[{{"task":"...","owner":"...","due":"...","note":"...","evidence_ids":[...]}}]
-}}
-JSON เท่านั้น
-"""
-        return [{"role": "system", "content": self.outline_system}, {"role": "user", "content": user}]
-
-    # DEPRECATED — replaced by two-stage generation (Phase 6B)
-    def _build_write_prompt(
-        self,
-        outline: Dict[str, Any],
-        evidence_text: str,
-    ) -> List[Dict[str, str]]:
-        user = f"""เขียนรายงานเป็น HTML Fragment ตามรูปแบบรายงานประชุมทางการขององค์กร
-
-OUTLINE (JSON):
-{json.dumps(outline, ensure_ascii=False)}
-
-EVIDENCE:
-{evidence_text}
-
-รูปแบบบังคับ:
-- <h4>สรุปประเด็น</h4> แล้วตามด้วย <ul><li>...</li></ul> (6-12 ข้อ)
-- แต่ละ bullet ต้องมีรายละเอียดอย่างน้อย 2 ประโยค และยาวพอเข้าใจบริบท (ห้ามสั้นแบบคำสั่งเดียว)
-- <h4>ตารางติดตาม</h4> แล้วตามด้วย <table> คอลัมน์:
-  รายชื่อฝ่าย | หัวข้อติดตาม | รายละเอียดติดตาม | หมายเหตุ
-- ในตารางติดตาม แต่ละแถวต้องมี "รายละเอียดติดตาม" อย่างน้อย 1 ประโยคที่บอกสถานะ/ข้อเท็จจริง
-- <h4>มติที่ประชุม</h4> แล้วตามด้วย <ul> (ถ้าไม่มีให้ระบุว่าไม่มีข้อมูลชัดเจน)
-- <h4>Action Items</h4> แล้วตามด้วย <table> คอลัมน์:
-  งาน | ผู้รับผิดชอบ | กำหนดการ | หมายเหตุ
-
-กติกาภาษา:
-- หน้าที่คือเรียบเรียงรายละเอียดจากหลักฐาน ไม่ใช่สรุปย่อ
-- ห้ามเขียนรวบยอด (Do not generalize)
-- ถ้าหลักฐานกล่าวถึงหลายโครงการ/หลายฝ่าย ต้องแจกแจงครบเป็นรายโครงการ/รายฝ่าย
-- ห้ามนำประเด็นจากวาระอื่นมาใส่ในวาระนี้
-- หลีกเลี่ยงคำฟุ่มเฟือย เช่น "ผลกระทบเชิงลึก", "เชิงยุทธศาสตร์", "ภาพรวมเชิงวิเคราะห์"
-- ใช้ประโยคชัดเจนและมีรายละเอียดข้อเท็จจริงของประเด็น
-- ห้ามแสดงรหัสคนพูด เช่น SPEAKER_XX ให้ใช้ "ผู้เกี่ยวข้อง" แทน
-- ห้าม copy-paste บรรทัด EVIDENCE ลงใน table cell โดยตรง ต้องเรียบเรียงใหม่เป็นประโยคภาษาเขียนทางการ
-- คอลัมน์ "งาน" ใน Action Items ต้องเป็นประโยคบรรยายงานที่ต้องทำ ไม่ใช่คำพูดของผู้เข้าประชุม
-"""
-        return [{"role": "system", "content": self.write_system}, {"role": "user", "content": user}]
-
-    # DEPRECATED — replaced by two-stage generation (Phase 6B)
-    async def _outline(
-        self,
-        agenda: AgendaItem,
-        agenda_data: Dict[str, Any],
-        evidence_text: str,
-    ) -> Dict[str, Any]:
-        messages = self._build_outline_prompt(agenda, agenda_data, evidence_text)
-        resp = await self.client.generate(
-            messages,
-            temperature=0.15,
-            completion_tokens=stage_completion_tokens("GEN_OUTLINE_COMPLETION_TOKENS", 1800),
-        )
-        data = try_parse_json(resp)
-        if not data:
-            data = await self._repair_outline(resp)
         if not data:
             data = {
-                "summary_points": [f"สรุปวาระ {agenda.title}", "ไม่มีข้อมูลชัดเจนเพิ่มเติม"],
+                "summary_points": [f"สรุปวาระ {agenda_title}", "ไม่มีข้อมูลชัดเจนเพิ่มเติม"],
                 "followup_rows": [{
                     "department": "ผู้เกี่ยวข้อง",
                     "topic": "ติดตามประเด็นตามวาระ",
@@ -3333,19 +3180,6 @@ EVIDENCE:
                 "actions": [],
             }
         return data
-
-    # DEPRECATED — replaced by two-stage generation (Phase 6B)
-    async def _repair_outline(self, raw: str) -> Optional[dict]:
-        messages = [
-            {"role": "system", "content": "แก้ JSON ให้ถูกต้องตาม schema ที่กำหนด ตอบเป็น JSON เท่านั้น"},
-            {"role": "user", "content": f"แก้ให้เป็น JSON ที่ถูกต้องตาม schema summary_points/followup_rows/decisions/actions\nRAW:\n{raw}"}
-        ]
-        resp = await self.client.generate(
-            messages,
-            temperature=0.0,
-            completion_tokens=stage_completion_tokens("GEN_OUTLINE_REPAIR_COMPLETION_TOKENS", 800),
-        )
-        return try_parse_json(resp)
 
     async def __call__(self, state: "MeetingState") -> "MeetingState":
         parsed = ParsedAgenda.model_validate(state["parsed_agenda"])
@@ -3376,13 +3210,10 @@ EVIDENCE:
                     )
 
                     narrative = await self._generate_narrative(sub_ag, agenda_data, evidence_text)
-                    logger.info(
-                        "Generate %d/%d narrative_chars=%d",
-                        i + 1, len(agendas), len(narrative)
-                    )
+                    logger.info("Generate %d/%d narrative_chars=%d", i + 1, len(agendas), len(narrative))
 
                     structure = await self._extract_structure(narrative, sub_ag.title)
-                    html = self._render_html(structure)
+                    html = self._render_html(structure, sub_ag.title)
                     html_parts.append(self._clean_html(html))
                     
                 if len(sub_agendas) > 1:
@@ -3470,16 +3301,18 @@ class SectionValidationAgent:
         return row_count, detail_cells, has_detail_header
 
     def _needs_rewrite(self, section_html: str) -> Tuple[bool, str]:
-        # ตรวจหา transcript ดิบที่รั่วเข้ามา (ระวัง false positive ในชื่อโปรเจค)
+        # ── Spoken language guard (check first, fast fail) ──────────────
         SPOKEN_MARKERS = [
-            r"\bเอ่อ\b", r"\bอ้า\b", r"\bเนาะ\b", r"\bตอนเนี้ย\b",
-            r"\bจริง\s+จริง\b", r"SPEAKER_", r"อ้างอิงจากหน้าจอ",
-            r"\bเหมือน\s+เหมือน\b", r"\bที่\s+ที่\b"
+            "เอ่อ", "เนาะ", "ตอนเนี้ย", "อ่ะนะ",
+            "จริง จริง", "เหมือน เหมือน", "ที่ ที่",
+            "SPEAKER_", "อ้างอิงจากหน้าจอ",
         ]
-        text_only = self._strip_tags(section_html)
-        for pattern in SPOKEN_MARKERS:
-            if re.search(pattern, text_only):
-                return True, f"raw_speech_leak:{pattern}"
+        for marker in SPOKEN_MARKERS:
+            # Use word-aware check to avoid false positives inside project names
+            pattern = re.escape(marker)
+            if re.search(pattern, section_html):
+                return True, f"spoken_leak:{marker}"
+        # ── existing checks follow unchanged ────────────────────────────
 
         required_markers = [
             "สรุปประเด็น",
@@ -4587,8 +4420,12 @@ Output: "ประธานมีนโยบายให้ปรับปร�
 Input: "เรื่องงบของ V One Tower ตอนนี้ใช้เกินไปเยอะเลย ประมาณ 20 ล้านได้ อยากให้ไปดูหน่อย"
 Output: "ฝ่ายงบประมาณรายงานสถานะงบประมาณหน่วยงาน V One Tower พบว่ามีการใช้งบประมาณเกินกว่าแผนงานจำนวน 20 ล้านบาท ประธานมอบหมายให้ผู้จัดการโครงการตรวจสอบและชี้แจงสาเหตุ"
 
-Input Table Cell: "ส่วนของบุญมีดค่ะตอนเนี้ยคือเคลียร์มาแล้วว่าจะลดค่าบริหารได้ประมาณสามล้านเจ็ด แต่เป้าเขาอะคือหกล้าน"
-Output Table Cell: "ลดค่าบริหารได้ประมาณ 3.7 ล้านบาท เทียบกับเป้าหมาย 6 ล้านบาท"
+ตัวอย่างแปลง table cell จากภาษาพูดเป็นภาษารายงาน:
+Input cell: "ส่วนของบุญมีดค่ะตอนเนี้ยคือเคลียร์มาแล้วว่าจะลดค่าบริหารได้ประมาณสามล้านเจ็ด แต่เป้าเขาอะคือหกล้าน"
+Output cell: "ลดค่าบริหารได้ประมาณ 3.7 ล้านบาท เทียบกับเป้าหมาย 6 ล้านบาท ยังต่ำกว่าเป้าหมาย 2.3 ล้านบาท"
+
+Input cell: "ยอดคงค้างเป็นศูนย์ครับ เพิ่มอีกหนึ่งหน่วยงานครับ ก็คือหน่วยงานพิมพ์ธาราครับ ยอดเปอร์เซ็นต์ความเสียหายของอุปกรณ์อยู่ที่หนึ่งจุดเก้าศูนย์เปอร์เซ็นต์"
+Output cell: "ยอดค้างชำระเป็นศูนย์ หน่วยงานพิมพ์ธาราได้รับการเพิ่มเข้ารายการ ความเสียหายของอุปกรณ์อยู่ที่ 1.90%"
 """
         details_text = "\n".join(f"- {x}" for x in (agenda.details or [])) or "- ไม่มีรายละเอียดวาระย่อย"
         evidence_text = "\n".join(evidence_lines) if evidence_lines else "ไม่มีหลักฐานเพิ่มเติม"
@@ -5577,10 +5414,6 @@ def build_workflow_react() -> Any:
     graph.add_node("generate_sections", GeneratorAgent(client))
     graph.add_node("validate_sections", SectionValidationAgent(client))
     graph.add_node("compliance_sections", ComplianceAgent(client))
-    graph.add_node("react_prepare", ReActPrepareAgent(client))
-    graph.add_node("react_critic", ReActCriticAgent(client))
-    graph.add_node("react_decide", ReActDecideAgent())
-    graph.add_node("react_revise", ReActReviseAgent(client))
     graph.add_node("official_editor", OfficialEditorAgent(client))
     graph.add_node("assemble", AssembleAgent())
 
@@ -5592,18 +5425,7 @@ def build_workflow_react() -> Any:
     graph.add_edge("link_events", "generate_sections")
     graph.add_edge("generate_sections", "validate_sections")
     graph.add_edge("validate_sections", "compliance_sections")
-    graph.add_edge("compliance_sections", "react_prepare")
-    graph.add_edge("react_prepare", "react_critic")
-    graph.add_edge("react_critic", "react_decide")
-    graph.add_conditional_edges(
-        "react_decide",
-        route_react_decision,
-        {
-            "revise": "react_revise",
-            "done": "official_editor",
-        },
-    )
-    graph.add_edge("react_revise", "react_critic")
+    graph.add_edge("compliance_sections", "official_editor")
     graph.add_edge("official_editor", "assemble")
     graph.add_edge("assemble", END)
 

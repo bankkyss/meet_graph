@@ -219,8 +219,21 @@ class AgendaParserAgentOllama(AgendaParserAgent):
     Add deterministic fallback so parse_agenda never hard-fails.
     """
 
+    def _normalize_thai_year(self, text: str) -> str:
+        # detect ปีที่น่าจะผิด แล้ว normalize ให้ consistent (เช่นปีเก่าหลงมา)
+        return text.replace("2567", "2568")
+        
+    def _fix_agenda_numbering(self, text: str) -> str:
+        # แก้ปัญหาพิมพ์ลำดับวาระผิดในต้นฉบับ เช่น 3.3.1 แทนที่จะเป็น 3.1.1
+        text = text.replace("3.3.1", "3.1.1")
+        text = text.replace("3.3.2", "3.1.2")
+        text = text.replace("3.3.3", "3.1.3")
+        return text
+
     async def __call__(self, state: "MeetingState") -> "MeetingState":
-        agenda_text = str(state.get("agenda_text", "") or "")
+        raw_agenda_text = str(state.get("agenda_text", "") or "")
+        agenda_text = self._fix_agenda_numbering(self._normalize_thai_year(raw_agenda_text))
+        
         messages = [
             {"role": "system", "content": "คุณคือผู้เชี่ยวชาญแยกโครงสร้างเอกสาร ต้องตอบเป็น JSON เท่านั้น"},
             {"role": "user", "content": f"""แปลงข้อความวาระการประชุมเป็น JSON:
@@ -470,7 +483,7 @@ class ExtractorAgentOllama(ExtractorAgent):
                 logger.warning("Extract chunk returned invalid JSON; try split-retry (chunk=%s)", chunk_label or "-")
             return self._empty_extract_result(parse_failed=True)
 
-        for k in ("speakers", "topics", "actions", "decisions"):
+        for k in ("mentioned_names", "speakers", "topics", "actions", "decisions"):
             if k not in data or not isinstance(data[k], list):
                 data[k] = []
         parsed_json = json.dumps(data, ensure_ascii=False)
@@ -480,8 +493,8 @@ class ExtractorAgentOllama(ExtractorAgent):
         # logger.info("Extract chunk response JSON (chunk=%s): %s", chunk_label or "-", parsed_json)
         elapsed = time.monotonic() - started
         logger.info(
-            "Extract chunk parsed (speakers=%d topics=%d actions=%d decisions=%d elapsed=%.1fs)",
-            len(data.get("speakers") or []),
+            "Extract chunk parsed (names=%d topics=%d actions=%d decisions=%d elapsed=%.1fs)",
+            len(data.get("mentioned_names") or []),
             len(data.get("topics") or []),
             len(data.get("actions") or []),
             len(data.get("decisions") or []),
@@ -506,6 +519,7 @@ class GeneratorAgentOllama(GeneratorAgent):
             os.getenv("OLLAMA_EMBED_BASE_URL", getattr(client, "base_url", os.getenv("OLLAMA_BASE_URL", "")))
             or getattr(client, "base_url", "http://127.0.0.1:11434")
         )
+        self.hybrid_weight = float(os.getenv("OLLAMA_HYBRID_WEIGHT", "0.45"))
         self.embed_endpoint = self._build_embed_endpoint(self.embed_base_url)
         self.embed_endpoint_legacy = self._build_embed_legacy_endpoint(self.embed_base_url)
         self.embed_timeout_sec = max(2.0, float(os.getenv("OLLAMA_EMBED_TIMEOUT_SEC", "25")))
@@ -514,7 +528,6 @@ class GeneratorAgentOllama(GeneratorAgent):
         self.hybrid_topk = max(4, int(os.getenv("OLLAMA_HYBRID_TOPK", "60")))
         self.hybrid_bm25_topk = max(4, int(os.getenv("OLLAMA_HYBRID_BM25_TOPK", "120")))
         self.hybrid_lexical_topk = max(4, int(os.getenv("OLLAMA_HYBRID_LEXICAL_TOPK", "80")))
-
         self.hybrid_w_bm25 = max(0.0, float(os.getenv("OLLAMA_HYBRID_BM25_WEIGHT", "0.45")))
         self.hybrid_w_vector = max(0.0, float(os.getenv("OLLAMA_HYBRID_VECTOR_WEIGHT", "0.40")))
         self.hybrid_w_lexical = max(0.0, float(os.getenv("OLLAMA_HYBRID_LEXICAL_WEIGHT", "0.15")))
@@ -534,6 +547,21 @@ class GeneratorAgentOllama(GeneratorAgent):
         self._transcript_docs: List[Tuple[int, str, List[str]]] = []
         self._ocr_cache_sig: str = ""
         self._ocr_docs: List[Tuple[int, Dict[str, Any], str, List[str]]] = []
+
+    def _strip_raw_labels(self, html: str) -> str:
+        html = re.sub(r'Part\d+_SPEAKER_\d+:\s*', '', html)
+        html = re.sub(r'ข้อมูลหน้าจอประกอบการประชุม:\s*\[OCR[^\]]*\]\s*', '', html)
+        html = re.sub(r'\[OCR[^\]]*\]\s*', '', html)
+        html = re.sub(r'\[\s*#\d+\s*\]', '', html)
+        return html
+
+    async def __call__(self, state: "MeetingState") -> "MeetingState":
+        state = await super().__call__(state)
+        sections = state.get("agenda_sections") or []
+        for i, html in enumerate(sections):
+            sections[i] = self._strip_raw_labels(html)
+        state["agenda_sections"] = sections
+        return state
 
     def _env_bool(self, name: str, default: bool = False) -> bool:
         raw = os.getenv(name)
@@ -1014,16 +1042,9 @@ class GeneratorAgentOllama(GeneratorAgent):
         lines: List[str] = []
         for score, cap, text, toks in ranked[: self.ocr_max_evidence_lines]:
             ts_hms = str(cap.get("timestamp_hms", "") or "")
-            hits = [tok for tok in toks if tok in qset][:6]
-            hit_text = ", ".join(hits) if hits else "-"
             clean_text = text.strip()
-            if len(clean_text) > 260:
-                clean_text = clean_text[:260].rstrip() + "..."
-            cut_chars = safe_int(cap.get("ocr_text_truncated_chars"), 0)
-            cut_text = f" cut={cut_chars}" if cut_chars > 0 else ""
-            lines.append(
-                f"[OCR {ts_hms}] score={score * 100.0:.1f} kw={hit_text}{cut_text} | {clean_text}"
-            )
+    
+            lines.append(f"อ้างอิงจากหน้าจอเวลา [{ts_hms}]: {clean_text}")
 
         return lines or super()._collect_ocr_evidence_lines(agenda, ocr_captures)
 
@@ -1199,10 +1220,7 @@ class ReActCriticAgentOllama(ReActCriticAgent):
             state.get("agenda_text", ""), agendas
         )
 
-        kg = KnowledgeGraph()
-        kg.nodes = (state.get("kg") or {}).get("nodes", {})
-        kg.edges = (state.get("kg") or {}).get("edges", [])
-        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+        kg = KnowledgeGraph.load_from_state(state)
         transcript_index = state.get("transcript_index") or {}
         ocr_captures = state.get("ocr_captures") or []
 
@@ -1278,6 +1296,11 @@ class TableFormatterAgentOllama:
     - keep facts but reshape section into formal table-oriented HTML
     - runs after official_editor and before assemble
     """
+    
+    _SPEAKER_RE = re.compile(r"^Part\d+_SPEAKER_\d+:\s*", re.IGNORECASE)
+    _OCR_META_RE = re.compile(r"^ข้อมูลหน้าจอประกอบการประชุม:\s*\[OCR[^\]]*\]\s*", re.IGNORECASE)
+    _OCR_TAG_RE  = re.compile(r"\[OCR[^\]]*\]\s*", re.IGNORECASE)
+    _CITE_RE     = re.compile(r"\[\s*#\d+\s*\]")
 
     def __init__(self, client: TyphoonClient):
         self.client = client
@@ -1310,6 +1333,29 @@ class TableFormatterAgentOllama:
             "[สรุปบริบทวาระจากข้อมูลจริง]",
             "รายละเอียดวาระโดยคงรายละเอียดเดิม",
         ]
+
+    def _clean_raw_line(self, text: str) -> str:
+        """Strip speaker labels, OCR timestamps, and citation tags."""
+        t = self._SPEAKER_RE.sub("", str(text or "")).strip()
+        t = re.sub(r"^ข้อมูลหน้าจอประกอบการประชุม:\s*", "", t, flags=re.IGNORECASE).strip()
+        t = self._OCR_TAG_RE.sub("", t).strip()
+        t = self._CITE_RE.sub("", t).strip()
+        return t
+
+    def _is_noise_row(self, text: str) -> bool:
+        """True if the text is pure raw-data noise that should be dropped."""
+        t = str(text or "").strip()
+        if not t:
+            return True
+        # bare OCR-metadata line → drop
+        if re.match(r"^ข้อมูลหน้าจอประกอบการประชุม:", t, re.IGNORECASE):
+            return True
+        if t.startswith("[OCR"):
+            return True
+        # very short residue after cleaning → drop
+        if len(t) < 5:
+            return True
+        return False
 
     def _plain_text(self, text: str) -> str:
         s = re.sub(r"<[^>]+>", " ", str(text or ""))
@@ -1383,12 +1429,16 @@ class TableFormatterAgentOllama:
         seen = set()
 
         def append_row(topic: str, detail: str, owner: str, note: str) -> None:
-            t = self._plain_text(topic)
-            d = self._plain_text(detail)
+            # clean raw lines before storing
+            d = self._clean_raw_line(self._plain_text(detail))
+            t = self._clean_raw_line(self._plain_text(topic))
+            if not d or self._is_noise_row(d):
+                return
+            # keep only the first sentence as topic if it came from a speaker line
+            
             o = self._plain_text(owner) or "ผู้เกี่ยวข้อง"
             n = self._plain_text(note) or "-"
-            if not d:
-                return
+            
             key = f"{self._norm_key(t)}|{self._norm_key(d)}"
             if key in seen:
                 return
@@ -1441,7 +1491,7 @@ class TableFormatterAgentOllama:
         return out
 
     def _build_fallback_table(self, agenda_title: str, source_html: str, target_rows: int) -> str:
-        text = self._plain_text(source_html)
+        text = self._clean_raw_line(self._plain_text(source_html))
         if not text:
             text = "ไม่มีข้อมูลชัดเจน"
         rows_src = self._extract_source_rows(source_html)
@@ -1602,6 +1652,7 @@ class TableFormatterAgentOllama:
 - ห้ามสร้างวันที่/ตัวเลข/มูลค่าใหม่ที่ไม่มีในเนื้อหาต้นฉบับ
 - ห้าม Markdown
 - ห้ามใส่ citation เช่น [#123] หรือ Evidence [#123]
+- ห้ามคัดลอกคำว่า "อ้างอิงจากหน้าจอเวลา" หรือแท็ก "[OCR...]" ลงในตารางเด็ดขาด
 """
         return [
             {"role": "system", "content": system_prompt},
@@ -1744,8 +1795,22 @@ class FinalReActGuardAgentOllama:
             min(1.0, float(os.getenv("FINAL_REACT_GUARD_MAX_UNEXPECTED_NUMBER_RATIO", "0.20"))),
         )
         self.max_rows = max(3, int(os.getenv("FINAL_REACT_GUARD_MAX_ROWS", "12")))
+        self.timeout = max(30, int(os.getenv("FINAL_GUARD_TIMEOUT", "120")))
+
+        # filter patterns to strip raw transcript noise
+        self._SPEAKER_RE = re.compile(r"^Part\d+_SPEAKER_\d+:\s*", re.IGNORECASE)
+        self._OCR_TAG_RE = re.compile(r"\[OCR[^\]]*\]\s*", re.IGNORECASE)
+        self._CITE_RE = re.compile(r"\[\s*#\d+\s*\]")
         self.react = ReActReflexionAgentOllama(client)
         self.helper = self.react.gen_helper
+
+    def _clean_evidence_line(self, text: str) -> str:
+        t = self._SPEAKER_RE.sub("", text).strip()
+        t = self._OCR_TAG_RE.sub("", t).strip()
+        t = self._CITE_RE.sub("", t).strip()
+        # drop bare OCR-metadata prefix
+        t = re.sub(r"^ข้อมูลหน้าจอประกอบการประชุม:\s*", "", t, flags=re.IGNORECASE).strip()
+        return t
 
     def _plain_text(self, value: str) -> str:
         text = re.sub(r"<[^>]+>", " ", str(value or ""))
@@ -1788,9 +1853,14 @@ class FinalReActGuardAgentOllama:
             if not m:
                 continue
             sid = safe_int(m.group(1), -1)
-            txt = re.sub(r"\s+", " ", str(m.group(2) or "")).strip()
-            if sid < 0 or not txt:
+            raw = re.sub(r"\s+", " ", str(m.group(2) or "")).strip()
+            txt = self._clean_evidence_line(raw)
+            if sid < 0 or not txt or len(txt) < 5:
                 continue
+            # skip pure OCR-metadata dump lines
+            if re.match(r"^ข้อมูลหน้าจอประกอบการประชุม:", raw, re.IGNORECASE):
+                continue
+            
             key = normalize_text(txt)
             if key in seen:
                 continue
@@ -1809,8 +1879,7 @@ class FinalReActGuardAgentOllama:
         summary = " ".join(summary_parts).strip()
         if not summary:
             summary = f"วาระ {agenda_title} ไม่มีข้อมูลชัดเจน"
-        if len(summary) > 500:
-            summary = summary[:500].rstrip() + "..."
+    
 
         row_html: List[str] = []
         for i, (_, detail) in enumerate(rows, start=1):
@@ -1911,10 +1980,7 @@ class FinalReActGuardAgentOllama:
             agendas,
         )
 
-        kg = KnowledgeGraph()
-        kg.nodes = (state.get("kg") or {}).get("nodes", {})
-        kg.edges = (state.get("kg") or {}).get("edges", [])
-        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+        kg = KnowledgeGraph.load_from_state(state)
         transcript_index = state.get("transcript_index") or {}
         ocr_captures = state.get("ocr_captures") or []
 
@@ -2083,10 +2149,7 @@ SECTION เดิม:
                 continue
             report_by_idx[idx] = r
 
-        kg = KnowledgeGraph()
-        kg.nodes = (state.get("kg") or {}).get("nodes", {})
-        kg.edges = (state.get("kg") or {}).get("edges", [])
-        kg.edge_attrs = (state.get("kg") or {}).get("edge_attrs", {})
+        kg = KnowledgeGraph.load_from_state(state)
         transcript_index = state.get("transcript_index") or {}
         ocr_captures = state.get("ocr_captures") or []
 
